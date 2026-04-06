@@ -1,0 +1,16 @@
+GITHUB BRIDGE SETUP
+
+Add these variables in Railway:
+
+GITHUB_TOKEN=ghp_xxx_or_fine_grained_pat
+GITHUB_REPO=your-user/your-repo
+GITHUB_BRANCH=main
+
+Available endpoints:
+GET  /api/internal/git/health
+GET  /api/internal/git/tree
+GET  /api/internal/git/file?path=app/main.py
+GET  /api/internal/git/search?query=thread_id
+POST /api/internal/git/branch
+POST /api/internal/git/commit
+POST /api/internal/git/pr

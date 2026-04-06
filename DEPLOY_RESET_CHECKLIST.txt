@@ -1,0 +1,9 @@
+ORkio Reset Deploy Checklist
+
+1. Rodar migrations Alembic.
+2. Validar OPENAI_API_KEY, OPENAI_MODEL e DEFAULT_CHAT_MODEL.
+3. Validar APP_BASE_URL / WEB_ORIGIN / allowed origins.
+4. Validar MAX_STREAMS_PER_REPLICA e MAX_STREAMS_PER_IP.
+5. Testar /health, /api/chat e /api/chat/stream.
+6. Testar Summit voice mode com 1 agente.
+7. Somente depois habilitar multiagente em demo.

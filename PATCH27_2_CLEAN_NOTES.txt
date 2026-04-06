@@ -1,0 +1,8 @@
+PATCH 27.2 CLEAN
+- backend: files schema boot reconcile expanded for upload/admin files contract
+- backend: onboarding no longer blocks chat/realtime flows
+- backend: WhatsApp no longer required to complete onboarding
+- backend: summit/realtime language default changed to pt-BR
+- frontend: destination defaults to single-agent mode
+- frontend: summit realtime language default changed to pt-BR
+- frontend: onboarding modal no longer blocks first app access

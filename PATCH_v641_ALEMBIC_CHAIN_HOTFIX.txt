@@ -1,0 +1,14 @@
+PATCH v6.4.1 — Alembic chain hotfix
+
+Arquivos alterados:
+- alembic/versions/0018_patch0100_28_summit_hardening_legal.py
+  - down_revision: "0017" -> "0017_patch0100_27_1B_realtime_transcript_punct"
+- alembic/versions/0020_patch_v331a_onboarding_profile.py
+  - down_revision: "0019_patch0100_28_3_idempotency" -> "0019"
+
+Motivo:
+- Corrigir referências quebradas na árvore Alembic.
+- Remover falhas de resolução de revision durante upgrade/history/heads.
+
+Arquivo adicionado:
+- scripts/check_alembic_chain.py

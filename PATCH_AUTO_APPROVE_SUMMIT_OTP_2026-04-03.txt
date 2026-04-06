@@ -1,0 +1,23 @@
+PATCH_AUTO_APPROVE_SUMMIT_OTP_2026-04-03
+
+Objetivo
+Liberar entrada no /app para usuários Summit elegíveis após OTP bem-sucedido, sem depender de aprovação manual.
+
+Mudança
+- app/main.py
+- Novo helper: _auto_approve_summit_user_if_needed(...)
+- Chamado em:
+  - /api/auth/otp/verify
+  - /api/auth/login/verify-otp
+
+Regra
+- Se AUTO_APPROVE_SUMMIT_ON_OTP estiver ativo (default=true)
+- e o usuário for Summit elegível
+- e approved_at estiver vazio
+=> approved_at é preenchido automaticamente após OTP válido.
+
+Elegibilidade Summit
+- usage_tier começa com summit_
+- ou signup_source == investor
+- ou signup_code_label == efata777
+- ou product_scope == full

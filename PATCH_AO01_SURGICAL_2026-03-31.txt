@@ -1,0 +1,5 @@
+AO-01 surgical patch set
+- /api/chat/stream thread bootstrap now ensures owner membership on new threads
+- /api/chat/stream excludes current user message from history context
+- /api/chat/stream persists agent_name and calls _track_cost with aligned signature
+- /api/audio/transcriptions and /api/stt now share the same STT pipeline implementation

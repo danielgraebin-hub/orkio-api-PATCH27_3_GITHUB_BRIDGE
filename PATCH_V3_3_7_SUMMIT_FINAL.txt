@@ -1,0 +1,5 @@
+Orkio API Patch v3.3.7 Summit Final
+
+Included:
+- /api/admin/users now returns onboarding profile fields
+- DELETE /api/admin/users/{id} endpoint for controlled user removal

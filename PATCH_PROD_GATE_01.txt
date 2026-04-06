@@ -1,0 +1,10 @@
+PATCH PROD-GATE 01
+- OTP obrigatório por ambiente seguro:
+  * SUMMIT_REQUIRE_OTP default = true em produção
+- Endpoint /api/admin/debug/write-test desabilitado em produção por padrão
+  * reabilitar só com ENABLE_ADMIN_DEBUG_WRITE_TEST=true
+- Base.metadata.create_all removido do startup produtivo
+  * reabilitar só com ENABLE_STARTUP_CREATE_ALL=true
+- Rotas legadas /api/user/onboarding compat desabilitadas por padrão
+  * reabilitar só com ENABLE_LEGACY_ONBOARDING_COMPAT=true
+- _audit_realtime_safe corrigido para não carregar código legado inválido

@@ -1,0 +1,74 @@
+PATCH IRRESISTIVEL v4 — 2026-04-02
+
+OBJETIVO
+Executar a evolução subsequente do Orkio a partir da war room do Auditor sobre o v3, sem rewrite do tronco Summit Runtime.
+
+ESCOPO IMPLEMENTADO
+1. DAG execution-aware lite
+- dag_executor agora materializa:
+  - execution_cursor
+  - node.status
+  - dependencies
+  - readiness
+  - routing_source
+  - routing_override_reason
+- route_applied só fica true quando houve override/reordenação real.
+
+2. Planner lite supervisor
+- planner_snapshot passou a expor:
+  - execution_strategy
+  - fallback_strategy
+  - parallelizable_nodes
+  - confidence_threshold
+  - default_order
+  - routing_source / routing_override_reason
+
+3. Trial analytics híbrido
+- stage agora considera tempo + comportamento.
+- novos sinais:
+  - behavior_score
+  - activation_probability
+  - conversion_probability
+
+4. Runtime hints mais úteis
+- memory:
+  - freshest_updated_at
+  - strong_resume_ready
+  - resume_candidate
+- routing:
+  - routing_source
+  - override_reason
+  - execution_cursor
+- trial:
+  - behavior_score
+  - activation_probability
+  - conversion_probability
+
+5. Numerology hardening
+- /api/numerology/profile agora respeita a feature flag orkio.numerology.enabled.
+
+6. Console principal
+- AppConsole passa a usar /api/chat/stream como trilho principal.
+- fallback para /api/chat permanece.
+- parser SSE leve incluído, sem reescrever UX.
+
+VALIDAÇÕES
+- Backend: python -m compileall app => OK
+- Frontend: node node_modules/vite/bin/vite.js build => OK
+
+OBSERVAÇÃO
+O build web exigiu ajuste de permissão dos binários empacotados (.bin/vite e esbuild) dentro do node_modules do artefato recebido.
+
+VEREDITO
+v4 mantém o tronco auditado e avança nos P0/P1 centrais da war room:
+- menos narrativa inflada
+- mais execução consciente
+- SSE mais exercitado no console
+- governança de numerologia fim a fim
+
+
+=== PATCH IRRESISTIVEL v6 (2026-04-02) ===
+- baseline_order neutro derivado da seleção original de agentes
+- routing_confidence calculado e exposto em runtime_hints.routing
+- execution_cursor/execution_lifecycle enriquecidos
+- finalize_execution_snapshot aplicado ao runtime antes da resposta final

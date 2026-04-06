@@ -1,0 +1,21 @@
+
+PATCH v6.4.2 — REALTIME VERIFY PACK
+
+Objetivo:
+- manter o hotfix de cadeia Alembic
+- adicionar verificação estática rápida do contrato Realtime
+
+Arquivos adicionados:
+- scripts/verify_realtime_contract.py
+
+Uso:
+python scripts/check_alembic_chain.py
+python scripts/verify_realtime_contract.py
+alembic history
+alembic heads
+alembic upgrade head
+
+Smoke test esperado:
+1. POST /api/realtime/start -> 200
+2. POST /api/realtime/events:batch -> inserted_events > 0
+3. POST /api/realtime/end -> 200

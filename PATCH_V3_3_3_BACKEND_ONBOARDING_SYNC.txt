@@ -1,0 +1,23 @@
+PATCH v3.3.3 — BACKEND ONBOARDING SYNC
+
+Objetivo
+- Sincronizar o backend com o contrato final do onboarding do frontend.
+
+O que foi consolidado
+- app/routes/user.py atualizado
+- enums novos aceitos:
+  - user_type: founder, investor, operator, partner, other
+  - intent: explore, meeting, pilot, funding, other
+- aliases legados aceitos e normalizados:
+  - enterprise/developer -> operator
+  - exploring/curious -> explore
+  - company_eval -> pilot
+  - investment -> funding
+  - partnership -> meeting
+
+Validação feita
+- sintaxe do arquivo validada localmente
+
+Checklist de deploy
+- garantir que a API usada pelo web é esta versão
+- testar POST /api/user/onboarding com token válido
