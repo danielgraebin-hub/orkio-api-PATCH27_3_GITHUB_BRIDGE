@@ -2040,6 +2040,33 @@ async def _auth_rate_limit(request: Request) -> None:
 app = FastAPI(title="Orkio API", version=APP_VERSION)
 
 
+def _log_auth_route_diagnostics() -> None:
+    """Best-effort startup proof that the deployed build contains auth/register.
+    This does not change behavior; it only makes route publication explicit in logs.
+    """
+    try:
+        route_paths = []
+        for route in getattr(app, "routes", []):
+            path = getattr(route, "path", None)
+            methods = sorted(list(getattr(route, "methods", []) or []))
+            if path:
+                route_paths.append((path, methods))
+        auth_paths = [item for item in route_paths if str(item[0]).startswith("/api/auth")]
+        has_register = any(path == "/api/auth/register" for path, _ in auth_paths)
+        logger.warning("AUTH_ROUTE_DIAGNOSTICS has_register=%s auth_paths=%s", has_register, auth_paths)
+    except Exception:
+        try:
+            logger.exception("AUTH_ROUTE_DIAGNOSTICS_FAILED")
+        except Exception:
+            pass
+
+
+@app.on_event("startup")
+def _startup_auth_route_diagnostics():
+    _log_auth_route_diagnostics()
+
+
+
 def _route_methods_for(path: str) -> List[str]:
     methods = set()
     try:
