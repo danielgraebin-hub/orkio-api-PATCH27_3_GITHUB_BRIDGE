@@ -810,9 +810,32 @@ def get_request_org(user: Dict[str, Any], x_org_slug: Optional[str]) -> str:
 def _seed_default_summit_codes(db: Session, org: str = "public") -> None:
     """Create default Summit access codes if they do not already exist.
 
-    This avoids manual DB inserts in Railway when SUMMIT_MODE is enabled.
-    Codes are stored only as SHA-256 hashes and are created idempotently.
+    Hardened for production drift:
+    - creates signup_codes table if missing
+    - never raises out of startup/bootstrap
     """
+    try:
+        db.execute(text("""
+        CREATE TABLE IF NOT EXISTS signup_codes (
+            id VARCHAR PRIMARY KEY, org_slug VARCHAR NOT NULL, code_hash VARCHAR NOT NULL,
+            label VARCHAR NOT NULL, source VARCHAR NOT NULL, expires_at BIGINT,
+            max_uses INTEGER NOT NULL DEFAULT 500, used_count INTEGER NOT NULL DEFAULT 0,
+            active BOOLEAN NOT NULL DEFAULT TRUE, created_at BIGINT NOT NULL, created_by VARCHAR
+        )
+        """))
+        db.execute(text("CREATE INDEX IF NOT EXISTS ix_signup_codes_org ON signup_codes(org_slug)"))
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        try:
+            logger.exception("SIGNUP_CODES_BOOTSTRAP_CREATE_FAILED")
+        except Exception:
+            pass
+        return
+
     seeds = [
         {
             "id": "seed_summit2026_public",
@@ -834,36 +857,44 @@ def _seed_default_summit_codes(db: Session, org: str = "public") -> None:
         },
     ]
 
-    for item in seeds:
-        code_hash = hashlib.sha256(item["plain_code"].strip().upper().encode()).hexdigest()
-        existing = db.execute(
-            select(SignupCode).where(
-                SignupCode.org_slug == org,
-                SignupCode.code_hash == code_hash,
+    try:
+        for item in seeds:
+            code_hash = hashlib.sha256(item["plain_code"].strip().upper().encode()).hexdigest()
+            existing = db.execute(
+                select(SignupCode).where(
+                    SignupCode.org_slug == org,
+                    SignupCode.code_hash == code_hash,
+                )
+            ).scalar_one_or_none()
+            if existing:
+                continue
+
+            now = now_ts()
+            sc = SignupCode(
+                id=item["id"],
+                org_slug=org,
+                code_hash=code_hash,
+                label=item["label"],
+                source=item["source"],
+                expires_at=now + int(item["expires_days"]) * 86400,
+                max_uses=int(item["max_uses"]),
+                used_count=0,
+                active=True,
+                created_at=now,
+                created_by=item["created_by"],
             )
-        ).scalar_one_or_none()
-        if existing:
-            continue
+            db.add(sc)
 
-        now = now_ts()
-        sc = SignupCode(
-            id=item["id"],
-            org_slug=org,
-            code_hash=code_hash,
-            label=item["label"],
-            source=item["source"],
-            expires_at=now + int(item["expires_days"]) * 86400,
-            max_uses=int(item["max_uses"]),
-            used_count=0,
-            active=True,
-            created_at=now,
-            created_by=item["created_by"],
-        )
-        db.add(sc)
-
-    db.commit()
-
-
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        try:
+            logger.exception("SIGNUP_CODES_BOOTSTRAP_SEED_FAILED")
+        except Exception:
+            pass
 
 
 def _normalize_voice_id(raw: Optional[str], *, default: str = "cedar") -> str:
@@ -1294,7 +1325,15 @@ def ensure_schema(db: Session):
         db.execute(text("ALTER TABLE IF EXISTS messages ADD COLUMN IF NOT EXISTS agent_name VARCHAR"))
         # Files thread linkage (schema drift hotfix)
         db.execute(text("ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS thread_id VARCHAR"))
-        db.execute(text("CREATE INDEX IF NOT EXISTS ix_files_thread_id ON files(thread_id)"))
+        db.execute(text("""
+        DO $$
+        BEGIN
+            IF to_regclass('public.files') IS NOT NULL THEN
+                CREATE INDEX IF NOT EXISTS ix_files_thread_id ON files(thread_id);
+            END IF;
+        END
+        $$;
+        """))
         # Files uploader provenance (PATCH0100_7)
         db.execute(text("ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS uploader_id VARCHAR"))
         db.execute(text("ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS uploader_name VARCHAR"))
@@ -2038,33 +2077,6 @@ async def _auth_rate_limit(request: Request) -> None:
         dq.append(now)
 
 app = FastAPI(title="Orkio API", version=APP_VERSION)
-
-
-def _log_auth_route_diagnostics() -> None:
-    """Best-effort startup proof that the deployed build contains auth/register.
-    This does not change behavior; it only makes route publication explicit in logs.
-    """
-    try:
-        route_paths = []
-        for route in getattr(app, "routes", []):
-            path = getattr(route, "path", None)
-            methods = sorted(list(getattr(route, "methods", []) or []))
-            if path:
-                route_paths.append((path, methods))
-        auth_paths = [item for item in route_paths if str(item[0]).startswith("/api/auth")]
-        has_register = any(path == "/api/auth/register" for path, _ in auth_paths)
-        logger.warning("AUTH_ROUTE_DIAGNOSTICS has_register=%s auth_paths=%s", has_register, auth_paths)
-    except Exception:
-        try:
-            logger.exception("AUTH_ROUTE_DIAGNOSTICS_FAILED")
-        except Exception:
-            pass
-
-
-@app.on_event("startup")
-def _startup_auth_route_diagnostics():
-    _log_auth_route_diagnostics()
-
 
 
 def _route_methods_for(path: str) -> List[str]:
