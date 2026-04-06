@@ -1305,6 +1305,37 @@ def _audit(db: Session, org_slug: str, user_id: Optional[str], action: str, meta
             pass
 
 
+
+def _ensure_files_table_exists(db: Session) -> None:
+    """Production-safe bootstrap for files table before any index reconcile."""
+    try:
+        db.execute(text("""
+        CREATE TABLE IF NOT EXISTS files (
+            id VARCHAR PRIMARY KEY,
+            org_slug VARCHAR NOT NULL,
+            filename VARCHAR,
+            content_type VARCHAR,
+            size_bytes BIGINT,
+            thread_id VARCHAR,
+            scope_thread_id VARCHAR,
+            scope_agent_id VARCHAR,
+            origin VARCHAR,
+            storage_key VARCHAR,
+            created_at BIGINT
+        )
+        """))
+        _ensure_files_table_exists(db)
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        try:
+            logger.exception("FILES_TABLE_BOOTSTRAP_CREATE_FAILED")
+        except Exception:
+            pass
+
 def ensure_schema(db: Session):
     """Best-effort schema guard (Railway) + logs."""
     try:
@@ -1325,15 +1356,7 @@ def ensure_schema(db: Session):
         db.execute(text("ALTER TABLE IF EXISTS messages ADD COLUMN IF NOT EXISTS agent_name VARCHAR"))
         # Files thread linkage (schema drift hotfix)
         db.execute(text("ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS thread_id VARCHAR"))
-        db.execute(text("""
-        DO $$
-        BEGIN
-            IF to_regclass('public.files') IS NOT NULL THEN
-                CREATE INDEX IF NOT EXISTS ix_files_thread_id ON files(thread_id);
-            END IF;
-        END
-        $$;
-        """))
+        _ensure_files_table_exists(db)
         # Files uploader provenance (PATCH0100_7)
         db.execute(text("ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS uploader_id VARCHAR"))
         db.execute(text("ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS uploader_name VARCHAR"))
@@ -2632,6 +2655,7 @@ def _startup_schema_guard():
             return
 
         db = SessionLocal()
+        _ensure_files_table_exists(db)
         try:
             ensure_schema(db)
             try:
