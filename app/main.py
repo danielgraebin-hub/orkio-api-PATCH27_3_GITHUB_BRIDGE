@@ -2707,13 +2707,6 @@ def rag_fallback_recent_chunks(db: Session, org: str, file_ids: List[str], top_k
 # --- Railway / Edge hardening: always answer CORS preflight ---
 # Some proxies may return 502 if OPTIONS is not answered quickly.
 # CORSMiddleware should handle it, but this catch-all guarantees a fast 204.
-from fastapi import Response as _Resp
-
-@app.options('/{path:path}')
-async def _preflight(path: str):
-    return _Resp(status_code=204)
-
-
 @app.middleware("http")
 async def request_id_mw(request: Request, call_next):
     rid = request.headers.get("x-request-id") or new_id()
