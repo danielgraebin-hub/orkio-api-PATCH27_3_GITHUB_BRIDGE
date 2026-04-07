@@ -1324,7 +1324,6 @@ def _ensure_files_table_exists(db: Session) -> None:
             created_at BIGINT
         )
         """))
-        _ensure_files_table_exists(db)
         db.commit()
     except Exception:
         try:
@@ -1335,6 +1334,7 @@ def _ensure_files_table_exists(db: Session) -> None:
             logger.exception("FILES_TABLE_BOOTSTRAP_CREATE_FAILED")
         except Exception:
             pass
+
 
 def ensure_schema(db: Session):
     """Best-effort schema guard (Railway) + logs."""
