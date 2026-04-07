@@ -10,11 +10,9 @@ def _db_url() -> str:
         or os.getenv("DATABASE_URL_PUBLIC", "").strip().strip('"').strip("'")
         or os.getenv("DATABASE_URL", "").strip().strip('"').strip("'")
     )
-    # Normalize Railway internal hostname casing
     url = url.replace("Postgres.railway.internal", "postgres.railway.internal")
     if not url:
         return ""
-    # Railway sometimes provides postgres:// -> SQLAlchemy prefers postgresql://
     if url.startswith("postgres://"):
         url = "postgresql://" + url[len("postgres://"):]
     return url
@@ -31,10 +29,6 @@ def make_engine():
     pool_size = int(os.getenv("DB_POOL_SIZE", "5"))
     max_overflow = int(os.getenv("DB_MAX_OVERFLOW", "10"))
     pool_timeout = int(os.getenv("DB_POOL_TIMEOUT", "30"))
-    # PATCH0100_13: connect_timeout prevents startup from hanging when DB is
-    # unreachable (e.g. Railway private-network DNS not yet ready). Without
-    # this, psycopg2 blocks on TCP connect indefinitely, causing uvicorn to
-    # never emit "Application startup complete" and Railway to return 502.
     connect_timeout = int(os.getenv("DB_CONNECT_TIMEOUT", "5"))
     return create_engine(
         url,
@@ -56,9 +50,6 @@ def _reconcile_core_auth_schema_boot():
 
     try:
         with ENGINE.begin() as conn:
-            # =========================
-            # USERS
-            # =========================
             conn.execute(text("""
             CREATE TABLE IF NOT EXISTS users (
                 id VARCHAR PRIMARY KEY,
@@ -128,37 +119,26 @@ def _reconcile_core_auth_schema_boot():
                 conn.execute(text(stmt))
 
             conn.execute(text("""
-            UPDATE users
-            SET pw_hash = password_hash
-            WHERE pw_hash IS NULL
-              AND password_hash IS NOT NULL
+            UPDATE users SET pw_hash = password_hash
+            WHERE pw_hash IS NULL AND password_hash IS NOT NULL
             """))
             conn.execute(text("""
-            UPDATE users
-            SET password_hash = pw_hash
-            WHERE password_hash IS NULL
-              AND pw_hash IS NOT NULL
+            UPDATE users SET password_hash = pw_hash
+            WHERE password_hash IS NULL AND pw_hash IS NOT NULL
             """))
             conn.execute(text("""
-            UPDATE users
-            SET full_name = name
-            WHERE full_name IS NULL
-              AND name IS NOT NULL
+            UPDATE users SET full_name = name
+            WHERE full_name IS NULL AND name IS NOT NULL
             """))
             conn.execute(text("""
-            UPDATE users
-            SET name = full_name
-            WHERE name IS NULL
-              AND full_name IS NOT NULL
+            UPDATE users SET name = full_name
+            WHERE name IS NULL AND full_name IS NOT NULL
             """))
             conn.execute(text("UPDATE users SET role = 'user' WHERE role IS NULL"))
             conn.execute(text("UPDATE users SET is_active = TRUE WHERE is_active IS NULL"))
             conn.execute(text("UPDATE users SET onboarding_completed = FALSE WHERE onboarding_completed IS NULL"))
             conn.execute(text("UPDATE users SET marketing_consent = FALSE WHERE marketing_consent IS NULL"))
 
-            # =========================
-            # OTP_CODES
-            # =========================
             conn.execute(text("""
             CREATE TABLE IF NOT EXISTS otp_codes (
                 id VARCHAR PRIMARY KEY,
@@ -178,17 +158,14 @@ def _reconcile_core_auth_schema_boot():
                 "ALTER TABLE IF EXISTS otp_codes ADD COLUMN IF NOT EXISTS attempts INTEGER DEFAULT 0",
                 "ALTER TABLE IF EXISTS otp_codes ADD COLUMN IF NOT EXISTS verified BOOLEAN DEFAULT FALSE",
                 "ALTER TABLE IF EXISTS otp_codes ADD COLUMN IF NOT EXISTS created_at BIGINT",
-                "CREATE INDEX IF NOT EXISTS ix_otp_codes_user_id ON otp_codes(user_id)",
                 "ALTER TABLE IF EXISTS otp_codes ADD COLUMN IF NOT EXISTS email VARCHAR",
                 "ALTER TABLE IF EXISTS otp_codes ADD COLUMN IF NOT EXISTS used BOOLEAN DEFAULT FALSE",
+                "CREATE INDEX IF NOT EXISTS ix_otp_codes_user_id ON otp_codes(user_id)",
                 "CREATE INDEX IF NOT EXISTS ix_otp_codes_email ON otp_codes(email)",
             ]
             for stmt in stmts:
                 conn.execute(text(stmt))
 
-            # =========================
-            # USER_SESSIONS
-            # =========================
             conn.execute(text("""
             CREATE TABLE IF NOT EXISTS user_sessions (
                 id VARCHAR PRIMARY KEY,
@@ -225,9 +202,6 @@ def _reconcile_core_auth_schema_boot():
             for stmt in stmts:
                 conn.execute(text(stmt))
 
-            # =========================
-            # TERMS_ACCEPTANCES
-            # =========================
             conn.execute(text("""
             CREATE TABLE IF NOT EXISTS terms_acceptances (
                 id VARCHAR PRIMARY KEY,
@@ -250,9 +224,6 @@ def _reconcile_core_auth_schema_boot():
             for stmt in stmts:
                 conn.execute(text(stmt))
 
-            # =========================
-            # MARKETING_CONSENTS
-            # =========================
             conn.execute(text("""
             CREATE TABLE IF NOT EXISTS marketing_consents (
                 id VARCHAR PRIMARY KEY,
@@ -281,15 +252,11 @@ def _reconcile_core_auth_schema_boot():
             for stmt in stmts:
                 conn.execute(text(stmt))
 
-            # =========================
-            # THREADS
-            # =========================
             conn.execute(text("""
             CREATE TABLE IF NOT EXISTS threads (
                 id VARCHAR PRIMARY KEY,
                 org_slug VARCHAR,
                 title VARCHAR,
-                created_by VARCHAR,
                 created_at BIGINT
             )
             """))
@@ -297,16 +264,13 @@ def _reconcile_core_auth_schema_boot():
             stmts = [
                 "ALTER TABLE IF EXISTS threads ADD COLUMN IF NOT EXISTS org_slug VARCHAR",
                 "ALTER TABLE IF EXISTS threads ADD COLUMN IF NOT EXISTS title VARCHAR",
-                "ALTER TABLE IF EXISTS threads ADD COLUMN IF NOT EXISTS created_by VARCHAR",
                 "ALTER TABLE IF EXISTS threads ADD COLUMN IF NOT EXISTS created_at BIGINT",
+                "ALTER TABLE IF EXISTS threads ADD COLUMN IF NOT EXISTS created_by VARCHAR",
                 "CREATE INDEX IF NOT EXISTS ix_threads_org_slug ON threads(org_slug)",
             ]
             for stmt in stmts:
                 conn.execute(text(stmt))
 
-            # =========================
-            # MESSAGES
-            # =========================
             conn.execute(text("""
             CREATE TABLE IF NOT EXISTS messages (
                 id VARCHAR PRIMARY KEY,
@@ -336,6 +300,7 @@ def _reconcile_core_auth_schema_boot():
                 "ALTER TABLE IF EXISTS messages ADD COLUMN IF NOT EXISTS created_at BIGINT",
                 "CREATE INDEX IF NOT EXISTS ix_messages_thread_id ON messages(thread_id)",
                 "CREATE INDEX IF NOT EXISTS ix_messages_org_thread ON messages(org_slug, thread_id)",
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_messages_org_thread_client_msg ON messages(org_slug, thread_id, client_message_id)",
             ]
             for stmt in stmts:
                 conn.execute(text(stmt))
@@ -343,6 +308,115 @@ def _reconcile_core_auth_schema_boot():
         print("CORE_AUTH_SCHEMA_BOOT_OK")
     except Exception as e:
         print("CORE_AUTH_SCHEMA_BOOT_FAILED", str(e))
+
+
+def _reconcile_agents_schema_boot():
+    if ENGINE is None:
+        return
+
+    try:
+        with ENGINE.begin() as conn:
+            conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS agents (
+                id VARCHAR PRIMARY KEY,
+                org_slug VARCHAR NOT NULL,
+                name VARCHAR NOT NULL,
+                description TEXT,
+                system_prompt TEXT NOT NULL DEFAULT '',
+                model VARCHAR,
+                embedding_model VARCHAR,
+                temperature VARCHAR,
+                rag_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                rag_top_k INTEGER NOT NULL DEFAULT 6,
+                is_default BOOLEAN NOT NULL DEFAULT FALSE,
+                voice_id VARCHAR DEFAULT 'nova',
+                avatar_url VARCHAR,
+                created_at BIGINT NOT NULL,
+                updated_at BIGINT NOT NULL
+            )
+            """))
+
+            stmts = [
+                "ALTER TABLE IF EXISTS agents ADD COLUMN IF NOT EXISTS org_slug VARCHAR",
+                "ALTER TABLE IF EXISTS agents ADD COLUMN IF NOT EXISTS name VARCHAR",
+                "ALTER TABLE IF EXISTS agents ADD COLUMN IF NOT EXISTS description TEXT",
+                "ALTER TABLE IF EXISTS agents ADD COLUMN IF NOT EXISTS system_prompt TEXT DEFAULT ''",
+                "ALTER TABLE IF EXISTS agents ADD COLUMN IF NOT EXISTS model VARCHAR",
+                "ALTER TABLE IF EXISTS agents ADD COLUMN IF NOT EXISTS embedding_model VARCHAR",
+                "ALTER TABLE IF EXISTS agents ADD COLUMN IF NOT EXISTS temperature VARCHAR",
+                "ALTER TABLE IF EXISTS agents ADD COLUMN IF NOT EXISTS rag_enabled BOOLEAN NOT NULL DEFAULT TRUE",
+                "ALTER TABLE IF EXISTS agents ADD COLUMN IF NOT EXISTS rag_top_k INTEGER NOT NULL DEFAULT 6",
+                "ALTER TABLE IF EXISTS agents ADD COLUMN IF NOT EXISTS is_default BOOLEAN NOT NULL DEFAULT FALSE",
+                "ALTER TABLE IF EXISTS agents ADD COLUMN IF NOT EXISTS voice_id VARCHAR DEFAULT 'nova'",
+                "ALTER TABLE IF EXISTS agents ADD COLUMN IF NOT EXISTS avatar_url VARCHAR",
+                "ALTER TABLE IF EXISTS agents ADD COLUMN IF NOT EXISTS created_at BIGINT",
+                "ALTER TABLE IF EXISTS agents ADD COLUMN IF NOT EXISTS updated_at BIGINT",
+                "CREATE INDEX IF NOT EXISTS ix_agents_org_slug ON agents(org_slug)",
+                "CREATE INDEX IF NOT EXISTS ix_agents_updated_at ON agents(updated_at)",
+            ]
+            for stmt in stmts:
+                conn.execute(text(stmt))
+
+            conn.execute(text("UPDATE agents SET system_prompt = '' WHERE system_prompt IS NULL"))
+            conn.execute(text("UPDATE agents SET rag_enabled = TRUE WHERE rag_enabled IS NULL"))
+            conn.execute(text("UPDATE agents SET rag_top_k = 6 WHERE rag_top_k IS NULL"))
+            conn.execute(text("UPDATE agents SET is_default = FALSE WHERE is_default IS NULL"))
+            conn.execute(text("UPDATE agents SET voice_id = 'nova' WHERE voice_id IS NULL"))
+            conn.execute(text("UPDATE agents SET updated_at = created_at WHERE updated_at IS NULL AND created_at IS NOT NULL"))
+
+            conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS agent_knowledge (
+                id VARCHAR PRIMARY KEY,
+                org_slug VARCHAR NOT NULL,
+                agent_id VARCHAR NOT NULL,
+                file_id VARCHAR NOT NULL,
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at BIGINT NOT NULL
+            )
+            """))
+
+            stmts = [
+                "ALTER TABLE IF EXISTS agent_knowledge ADD COLUMN IF NOT EXISTS org_slug VARCHAR",
+                "ALTER TABLE IF EXISTS agent_knowledge ADD COLUMN IF NOT EXISTS agent_id VARCHAR",
+                "ALTER TABLE IF EXISTS agent_knowledge ADD COLUMN IF NOT EXISTS file_id VARCHAR",
+                "ALTER TABLE IF EXISTS agent_knowledge ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT TRUE",
+                "ALTER TABLE IF EXISTS agent_knowledge ADD COLUMN IF NOT EXISTS created_at BIGINT",
+                "CREATE INDEX IF NOT EXISTS ix_agent_knowledge_org_slug ON agent_knowledge(org_slug)",
+                "CREATE INDEX IF NOT EXISTS ix_agent_knowledge_agent_id ON agent_knowledge(agent_id)",
+                "CREATE INDEX IF NOT EXISTS ix_agent_knowledge_file_id ON agent_knowledge(file_id)",
+            ]
+            for stmt in stmts:
+                conn.execute(text(stmt))
+
+            conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS agent_links (
+                id VARCHAR PRIMARY KEY,
+                org_slug VARCHAR NOT NULL,
+                source_agent_id VARCHAR NOT NULL,
+                target_agent_id VARCHAR NOT NULL,
+                mode VARCHAR NOT NULL DEFAULT 'consult',
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at BIGINT NOT NULL
+            )
+            """))
+
+            stmts = [
+                "ALTER TABLE IF EXISTS agent_links ADD COLUMN IF NOT EXISTS org_slug VARCHAR",
+                "ALTER TABLE IF EXISTS agent_links ADD COLUMN IF NOT EXISTS source_agent_id VARCHAR",
+                "ALTER TABLE IF EXISTS agent_links ADD COLUMN IF NOT EXISTS target_agent_id VARCHAR",
+                "ALTER TABLE IF EXISTS agent_links ADD COLUMN IF NOT EXISTS mode VARCHAR NOT NULL DEFAULT 'consult'",
+                "ALTER TABLE IF EXISTS agent_links ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT TRUE",
+                "ALTER TABLE IF EXISTS agent_links ADD COLUMN IF NOT EXISTS created_at BIGINT",
+                "CREATE INDEX IF NOT EXISTS ix_agent_links_org_slug ON agent_links(org_slug)",
+                "CREATE INDEX IF NOT EXISTS ix_agent_links_source_agent_id ON agent_links(source_agent_id)",
+                "CREATE INDEX IF NOT EXISTS ix_agent_links_target_agent_id ON agent_links(target_agent_id)",
+            ]
+            for stmt in stmts:
+                conn.execute(text(stmt))
+
+        print("AGENTS_SCHEMA_RECONCILE_DB_BOOT_OK")
+    except Exception as e:
+        print("AGENTS_SCHEMA_RECONCILE_DB_BOOT_FAILED", str(e))
 
 
 def _reconcile_files_schema_boot():
@@ -418,13 +492,90 @@ def _reconcile_files_schema_boot():
             for stmt in stmts:
                 conn.execute(text(stmt))
 
-            # compatibilidade com schema legado de files
             conn.execute(text("""
-            UPDATE files
-            SET name = filename
-            WHERE name IS NULL
-              AND filename IS NOT NULL
+            UPDATE files SET name = filename
+            WHERE name IS NULL AND filename IS NOT NULL
             """))
+
+            conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS file_texts (
+                id VARCHAR PRIMARY KEY,
+                org_slug VARCHAR NOT NULL,
+                file_id VARCHAR NOT NULL,
+                text TEXT NOT NULL,
+                extracted_chars INTEGER NOT NULL DEFAULT 0,
+                created_at BIGINT NOT NULL
+            )
+            """))
+
+            stmts = [
+                "ALTER TABLE IF EXISTS file_texts ADD COLUMN IF NOT EXISTS org_slug VARCHAR",
+                "ALTER TABLE IF EXISTS file_texts ADD COLUMN IF NOT EXISTS file_id VARCHAR",
+                "ALTER TABLE IF EXISTS file_texts ADD COLUMN IF NOT EXISTS text TEXT",
+                "ALTER TABLE IF EXISTS file_texts ADD COLUMN IF NOT EXISTS extracted_chars INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE IF EXISTS file_texts ADD COLUMN IF NOT EXISTS created_at BIGINT",
+                "CREATE INDEX IF NOT EXISTS ix_file_texts_org_slug ON file_texts(org_slug)",
+                "CREATE INDEX IF NOT EXISTS ix_file_texts_file_id ON file_texts(file_id)",
+            ]
+            for stmt in stmts:
+                conn.execute(text(stmt))
+
+            conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS file_chunks (
+                id VARCHAR PRIMARY KEY,
+                org_slug VARCHAR NOT NULL,
+                file_id VARCHAR NOT NULL,
+                idx INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                agent_id VARCHAR,
+                agent_name VARCHAR,
+                created_at BIGINT NOT NULL
+            )
+            """))
+
+            stmts = [
+                "ALTER TABLE IF EXISTS file_chunks ADD COLUMN IF NOT EXISTS org_slug VARCHAR",
+                "ALTER TABLE IF EXISTS file_chunks ADD COLUMN IF NOT EXISTS file_id VARCHAR",
+                "ALTER TABLE IF EXISTS file_chunks ADD COLUMN IF NOT EXISTS idx INTEGER",
+                "ALTER TABLE IF EXISTS file_chunks ADD COLUMN IF NOT EXISTS content TEXT",
+                "ALTER TABLE IF EXISTS file_chunks ADD COLUMN IF NOT EXISTS agent_id VARCHAR",
+                "ALTER TABLE IF EXISTS file_chunks ADD COLUMN IF NOT EXISTS agent_name VARCHAR",
+                "ALTER TABLE IF EXISTS file_chunks ADD COLUMN IF NOT EXISTS created_at BIGINT",
+                "CREATE INDEX IF NOT EXISTS ix_file_chunks_org_slug ON file_chunks(org_slug)",
+                "CREATE INDEX IF NOT EXISTS ix_file_chunks_file_id ON file_chunks(file_id)",
+            ]
+            for stmt in stmts:
+                conn.execute(text(stmt))
+
+            conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id VARCHAR PRIMARY KEY,
+                org_slug VARCHAR NOT NULL,
+                user_id VARCHAR,
+                action VARCHAR NOT NULL,
+                meta TEXT,
+                request_id VARCHAR,
+                path VARCHAR,
+                status_code INTEGER,
+                latency_ms INTEGER,
+                created_at BIGINT NOT NULL
+            )
+            """))
+
+            stmts = [
+                "ALTER TABLE IF EXISTS audit_logs ADD COLUMN IF NOT EXISTS org_slug VARCHAR",
+                "ALTER TABLE IF EXISTS audit_logs ADD COLUMN IF NOT EXISTS user_id VARCHAR",
+                "ALTER TABLE IF EXISTS audit_logs ADD COLUMN IF NOT EXISTS action VARCHAR",
+                "ALTER TABLE IF EXISTS audit_logs ADD COLUMN IF NOT EXISTS meta TEXT",
+                "ALTER TABLE IF EXISTS audit_logs ADD COLUMN IF NOT EXISTS request_id VARCHAR",
+                "ALTER TABLE IF EXISTS audit_logs ADD COLUMN IF NOT EXISTS path VARCHAR",
+                "ALTER TABLE IF EXISTS audit_logs ADD COLUMN IF NOT EXISTS status_code INTEGER",
+                "ALTER TABLE IF EXISTS audit_logs ADD COLUMN IF NOT EXISTS latency_ms INTEGER",
+                "ALTER TABLE IF EXISTS audit_logs ADD COLUMN IF NOT EXISTS created_at BIGINT",
+                "CREATE INDEX IF NOT EXISTS ix_audit_logs_org_slug ON audit_logs(org_slug)",
+            ]
+            for stmt in stmts:
+                conn.execute(text(stmt))
 
         print("FILES_SCHEMA_RECONCILE_DB_BOOT_OK")
     except Exception as e:
@@ -432,6 +583,7 @@ def _reconcile_files_schema_boot():
 
 
 _reconcile_core_auth_schema_boot()
+_reconcile_agents_schema_boot()
 _reconcile_files_schema_boot()
 
 
