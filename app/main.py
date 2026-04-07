@@ -2144,7 +2144,8 @@ def _startup_runtime_fingerprint():
             _safe_build_fingerprint(),
         )
         logger.warning(
-            "ORKIO_API_ROUTES validate_access_code=%s summit_session_start=%s audio_transcriptions=%s realtime_start=%s realtime_end=%s",
+            "ORKIO_API_ROUTES register=%s validate_access_code=%s summit_session_start=%s audio_transcriptions=%s realtime_start=%s realtime_end=%s",
+            _route_methods_for("/api/auth/register"),
             _route_methods_for("/api/auth/validate-access-code"),
             _route_methods_for("/api/summit/sessions/start"),
             _route_methods_for("/api/audio/transcriptions"),
@@ -2674,7 +2675,7 @@ def _startup_schema_guard():
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_list(),
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
     allow_origin_regex=cors_origin_regex(),
@@ -2704,9 +2705,7 @@ def rag_fallback_recent_chunks(db: Session, org: str, file_ids: List[str], top_k
     return out
 
 
-# --- Railway / Edge hardening: always answer CORS preflight ---
-# Some proxies may return 502 if OPTIONS is not answered quickly.
-# CORSMiddleware should handle it, but this catch-all guarantees a fast 204.
+
 @app.middleware("http")
 async def request_id_mw(request: Request, call_next):
     rid = request.headers.get("x-request-id") or new_id()
@@ -3224,6 +3223,18 @@ def register(inp: RegisterIn, request: Request = None, x_org_slug: Optional[str]
     email = inp.email.lower().strip()
     is_admin_email = email in admin_emails()
 
+    try:
+        logger.warning(
+            "REGISTER_ATTEMPT org=%s email=%s summit_mode=%s access_code_present=%s accept_terms=%s",
+            org,
+            email,
+            SUMMIT_MODE,
+            bool(inp.access_code),
+            bool(inp.accept_terms),
+        )
+    except Exception:
+        pass
+
     if not _rate_limit_check(_rl_register_lock, _rl_register_calls, ip, _REGISTER_MAX_PER_MINUTE):
         raise HTTPException(status_code=429, detail="Muitas tentativas de registro. Aguarde 1 minuto.")
 
@@ -3401,6 +3412,11 @@ def register(inp: RegisterIn, request: Request = None, x_org_slug: Optional[str]
         return response
 
     _create_user_session(db, u.id, org, ip, signup_code_label, usage_tier)
+    try:
+        logger.warning("REGISTER_SUCCESS org=%s email=%s usage_tier=%s", org, email, usage_tier)
+    except Exception:
+        pass
+
     response["message"] = "Conta criada com sucesso."
     response["authenticated"] = True
     response["redirect_to"] = "/app"
