@@ -351,7 +351,6 @@ def _reconcile_files_schema_boot():
 
     try:
         with ENGINE.begin() as conn:
-            # Create critical tables first so later reconcile statements never explode
             conn.execute(text("""
             CREATE TABLE IF NOT EXISTS files (
                 id VARCHAR PRIMARY KEY,
@@ -371,7 +370,8 @@ def _reconcile_files_schema_boot():
                 extraction_failed BOOLEAN DEFAULT FALSE,
                 is_institutional BOOLEAN DEFAULT FALSE,
                 created_at BIGINT,
-                origin_thread_id VARCHAR
+                origin_thread_id VARCHAR,
+                name VARCHAR
             )
             """))
 
@@ -409,6 +409,7 @@ def _reconcile_files_schema_boot():
                 "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS is_institutional BOOLEAN NOT NULL DEFAULT FALSE",
                 "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS created_at BIGINT",
                 "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS origin_thread_id VARCHAR",
+                "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS name VARCHAR",
                 "CREATE INDEX IF NOT EXISTS ix_files_thread_id ON files(thread_id)",
                 "CREATE INDEX IF NOT EXISTS ix_files_scope_thread_id ON files(scope_thread_id)",
                 "CREATE INDEX IF NOT EXISTS ix_files_scope_agent_id ON files(scope_agent_id)",
@@ -416,6 +417,14 @@ def _reconcile_files_schema_boot():
             ]
             for stmt in stmts:
                 conn.execute(text(stmt))
+
+            # compatibilidade com schema legado de files
+            conn.execute(text("""
+            UPDATE files
+            SET name = filename
+            WHERE name IS NULL
+              AND filename IS NOT NULL
+            """))
 
         print("FILES_SCHEMA_RECONCILE_DB_BOOT_OK")
     except Exception as e:
