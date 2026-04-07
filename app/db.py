@@ -12,16 +12,14 @@ def _db_url() -> str:
         or os.getenv("DATABASE_URL", "").strip().strip('"').strip("'")
     )
 
-    # normaliza hostname interno Railway
     url = url.replace(
         "Postgres.railway.internal",
-        "postgres.railway.internal"
+        "postgres.railway.internal",
     )
 
     if not url:
         return ""
 
-    # Railway às vezes entrega postgres://
     if url.startswith("postgres://"):
         url = "postgresql://" + url[len("postgres://"):]
 
@@ -59,35 +57,55 @@ SessionLocal = (
     sessionmaker(
         autocommit=False,
         autoflush=False,
-        bind=ENGINE
+        bind=ENGINE,
     )
     if ENGINE else None
 )
 
 
-# =========================
-# CORE AUTH TABLES
-# =========================
-
 def _reconcile_core_auth_schema_boot():
-
     if ENGINE is None:
         return
 
     try:
-
         with ENGINE.begin() as conn:
-
             conn.execute(text("""
             CREATE TABLE IF NOT EXISTS users (
                 id VARCHAR PRIMARY KEY,
                 org_slug VARCHAR,
                 email VARCHAR UNIQUE NOT NULL,
+                name VARCHAR,
                 full_name VARCHAR,
                 password_hash VARCHAR,
                 is_active BOOLEAN DEFAULT TRUE,
                 created_at BIGINT
             )
+            """))
+
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS org_slug VARCHAR
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS email VARCHAR
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS name VARCHAR
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS full_name VARCHAR
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS password_hash VARCHAR
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS created_at BIGINT
+            """))
+
+            conn.execute(text("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ix_users_email ON users(email)
             """))
 
             conn.execute(text("""
@@ -102,6 +120,22 @@ def _reconcile_core_auth_schema_boot():
             """))
 
             conn.execute(text("""
+            ALTER TABLE IF EXISTS otp_codes ADD COLUMN IF NOT EXISTS email VARCHAR NOT NULL
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS otp_codes ADD COLUMN IF NOT EXISTS code_hash VARCHAR NOT NULL
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS otp_codes ADD COLUMN IF NOT EXISTS expires_at BIGINT
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS otp_codes ADD COLUMN IF NOT EXISTS used BOOLEAN DEFAULT FALSE
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS otp_codes ADD COLUMN IF NOT EXISTS created_at BIGINT
+            """))
+
+            conn.execute(text("""
             CREATE TABLE IF NOT EXISTS user_sessions (
                 id VARCHAR PRIMARY KEY,
                 user_id VARCHAR,
@@ -109,6 +143,19 @@ def _reconcile_core_auth_schema_boot():
                 expires_at BIGINT,
                 created_at BIGINT
             )
+            """))
+
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS user_sessions ADD COLUMN IF NOT EXISTS user_id VARCHAR
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS user_sessions ADD COLUMN IF NOT EXISTS session_token VARCHAR
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS user_sessions ADD COLUMN IF NOT EXISTS expires_at BIGINT
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS user_sessions ADD COLUMN IF NOT EXISTS created_at BIGINT
             """))
 
             conn.execute(text("""
@@ -121,6 +168,16 @@ def _reconcile_core_auth_schema_boot():
             """))
 
             conn.execute(text("""
+            ALTER TABLE IF EXISTS threads ADD COLUMN IF NOT EXISTS org_slug VARCHAR
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS threads ADD COLUMN IF NOT EXISTS created_by VARCHAR
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS threads ADD COLUMN IF NOT EXISTS created_at BIGINT
+            """))
+
+            conn.execute(text("""
             CREATE TABLE IF NOT EXISTS messages (
                 id VARCHAR PRIMARY KEY,
                 thread_id VARCHAR,
@@ -130,25 +187,31 @@ def _reconcile_core_auth_schema_boot():
             )
             """))
 
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS messages ADD COLUMN IF NOT EXISTS thread_id VARCHAR
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS messages ADD COLUMN IF NOT EXISTS role VARCHAR
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS messages ADD COLUMN IF NOT EXISTS content TEXT
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS messages ADD COLUMN IF NOT EXISTS created_at BIGINT
+            """))
+
         print("CORE_AUTH_SCHEMA_BOOT_OK")
 
     except Exception as e:
         print("CORE_AUTH_SCHEMA_BOOT_FAILED", str(e))
 
 
-# =========================
-# FILES + SIGNUP CODES
-# =========================
-
 def _reconcile_files_schema_boot():
-
     if ENGINE is None:
         return
 
     try:
-
         with ENGINE.begin() as conn:
-
             conn.execute(text("""
             CREATE TABLE IF NOT EXISTS files (
                 id VARCHAR PRIMARY KEY,
@@ -173,6 +236,68 @@ def _reconcile_files_schema_boot():
             """))
 
             conn.execute(text("""
+            ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS org_slug VARCHAR
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS thread_id VARCHAR
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS uploader_id VARCHAR
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS uploader_name VARCHAR
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS uploader_email VARCHAR
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS filename VARCHAR
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS original_filename VARCHAR
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS origin VARCHAR
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS scope_thread_id VARCHAR
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS scope_agent_id VARCHAR
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS mime_type VARCHAR
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS size_bytes BIGINT DEFAULT 0
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS content BYTEA
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS extraction_failed BOOLEAN DEFAULT FALSE
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS is_institutional BOOLEAN DEFAULT FALSE
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS created_at BIGINT
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS origin_thread_id VARCHAR
+            """))
+
+            conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS ix_files_thread_id ON files(thread_id)
+            """))
+            conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS ix_files_scope_thread_id ON files(scope_thread_id)
+            """))
+            conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS ix_files_scope_agent_id ON files(scope_agent_id)
+            """))
+
+            conn.execute(text("""
             CREATE TABLE IF NOT EXISTS signup_codes (
                 id VARCHAR PRIMARY KEY,
                 org_slug VARCHAR NOT NULL,
@@ -188,33 +313,57 @@ def _reconcile_files_schema_boot():
             )
             """))
 
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS signup_codes ADD COLUMN IF NOT EXISTS org_slug VARCHAR NOT NULL
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS signup_codes ADD COLUMN IF NOT EXISTS code_hash VARCHAR NOT NULL
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS signup_codes ADD COLUMN IF NOT EXISTS label VARCHAR NOT NULL
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS signup_codes ADD COLUMN IF NOT EXISTS source VARCHAR NOT NULL
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS signup_codes ADD COLUMN IF NOT EXISTS expires_at BIGINT
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS signup_codes ADD COLUMN IF NOT EXISTS max_uses INTEGER DEFAULT 500
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS signup_codes ADD COLUMN IF NOT EXISTS used_count INTEGER DEFAULT 0
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS signup_codes ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT TRUE
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS signup_codes ADD COLUMN IF NOT EXISTS created_at BIGINT
+            """))
+            conn.execute(text("""
+            ALTER TABLE IF EXISTS signup_codes ADD COLUMN IF NOT EXISTS created_by VARCHAR
+            """))
+
+            conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS ix_signup_codes_org ON signup_codes(org_slug)
+            """))
+
         print("FILES_SCHEMA_RECONCILE_DB_BOOT_OK")
 
     except Exception as e:
         print("FILES_SCHEMA_RECONCILE_DB_BOOT_FAILED", str(e))
 
 
-# =========================
-# EXECUTE BOOTSTRAP
-# =========================
-
 _reconcile_core_auth_schema_boot()
 _reconcile_files_schema_boot()
 
 
-# =========================
-# DB SESSION DEPENDENCY
-# =========================
-
 def get_db():
-
     if SessionLocal is None:
         raise RuntimeError("DATABASE_URL not configured")
 
     db = SessionLocal()
-
     try:
         yield db
-
     finally:
         db.close()
