@@ -419,6 +419,123 @@ def _reconcile_agents_schema_boot():
         print("AGENTS_SCHEMA_RECONCILE_DB_BOOT_FAILED", str(e))
 
 
+def _reconcile_collab_and_realtime_schema_boot():
+    if ENGINE is None:
+        return
+
+    try:
+        with ENGINE.begin() as conn:
+            conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS thread_members (
+                id VARCHAR PRIMARY KEY,
+                org_slug VARCHAR NOT NULL,
+                thread_id VARCHAR NOT NULL,
+                user_id VARCHAR NOT NULL,
+                role VARCHAR NOT NULL,
+                created_at BIGINT NOT NULL
+            )
+            """))
+
+            stmts = [
+                "ALTER TABLE IF EXISTS thread_members ADD COLUMN IF NOT EXISTS org_slug VARCHAR",
+                "ALTER TABLE IF EXISTS thread_members ADD COLUMN IF NOT EXISTS thread_id VARCHAR",
+                "ALTER TABLE IF EXISTS thread_members ADD COLUMN IF NOT EXISTS user_id VARCHAR",
+                "ALTER TABLE IF EXISTS thread_members ADD COLUMN IF NOT EXISTS role VARCHAR",
+                "ALTER TABLE IF EXISTS thread_members ADD COLUMN IF NOT EXISTS created_at BIGINT",
+                "CREATE INDEX IF NOT EXISTS ix_thread_members_org_slug ON thread_members(org_slug)",
+                "CREATE INDEX IF NOT EXISTS ix_thread_members_thread_id ON thread_members(thread_id)",
+                "CREATE INDEX IF NOT EXISTS ix_thread_members_user_id ON thread_members(user_id)",
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_thread_members_thread_user ON thread_members(thread_id, user_id)",
+            ]
+            for stmt in stmts:
+                conn.execute(text(stmt))
+
+            conn.execute(text("""
+            UPDATE thread_members SET role = 'member'
+            WHERE role IS NULL OR role = ''
+            """))
+
+            conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS realtime_sessions (
+                id VARCHAR PRIMARY KEY,
+                org_slug VARCHAR NOT NULL,
+                thread_id VARCHAR NOT NULL,
+                agent_id VARCHAR,
+                agent_name VARCHAR,
+                user_id VARCHAR,
+                user_name VARCHAR,
+                model VARCHAR,
+                voice VARCHAR,
+                started_at BIGINT NOT NULL,
+                ended_at BIGINT,
+                meta TEXT
+            )
+            """))
+
+            stmts = [
+                "ALTER TABLE IF EXISTS realtime_sessions ADD COLUMN IF NOT EXISTS org_slug VARCHAR",
+                "ALTER TABLE IF EXISTS realtime_sessions ADD COLUMN IF NOT EXISTS thread_id VARCHAR",
+                "ALTER TABLE IF EXISTS realtime_sessions ADD COLUMN IF NOT EXISTS agent_id VARCHAR",
+                "ALTER TABLE IF EXISTS realtime_sessions ADD COLUMN IF NOT EXISTS agent_name VARCHAR",
+                "ALTER TABLE IF EXISTS realtime_sessions ADD COLUMN IF NOT EXISTS user_id VARCHAR",
+                "ALTER TABLE IF EXISTS realtime_sessions ADD COLUMN IF NOT EXISTS user_name VARCHAR",
+                "ALTER TABLE IF EXISTS realtime_sessions ADD COLUMN IF NOT EXISTS model VARCHAR",
+                "ALTER TABLE IF EXISTS realtime_sessions ADD COLUMN IF NOT EXISTS voice VARCHAR",
+                "ALTER TABLE IF EXISTS realtime_sessions ADD COLUMN IF NOT EXISTS started_at BIGINT",
+                "ALTER TABLE IF EXISTS realtime_sessions ADD COLUMN IF NOT EXISTS ended_at BIGINT",
+                "ALTER TABLE IF EXISTS realtime_sessions ADD COLUMN IF NOT EXISTS meta TEXT",
+                "CREATE INDEX IF NOT EXISTS ix_realtime_sessions_org_slug ON realtime_sessions(org_slug)",
+                "CREATE INDEX IF NOT EXISTS ix_realtime_sessions_thread_id ON realtime_sessions(thread_id)",
+            ]
+            for stmt in stmts:
+                conn.execute(text(stmt))
+
+            conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS realtime_events (
+                id VARCHAR PRIMARY KEY,
+                org_slug VARCHAR NOT NULL,
+                session_id VARCHAR NOT NULL,
+                thread_id VARCHAR NOT NULL,
+                speaker_type VARCHAR NOT NULL,
+                speaker_id VARCHAR,
+                agent_id VARCHAR,
+                agent_name VARCHAR,
+                event_type VARCHAR NOT NULL,
+                transcript_raw TEXT,
+                transcript_punct TEXT,
+                created_at BIGINT NOT NULL,
+                client_event_id VARCHAR,
+                meta TEXT
+            )
+            """))
+
+            stmts = [
+                "ALTER TABLE IF EXISTS realtime_events ADD COLUMN IF NOT EXISTS org_slug VARCHAR",
+                "ALTER TABLE IF EXISTS realtime_events ADD COLUMN IF NOT EXISTS session_id VARCHAR",
+                "ALTER TABLE IF EXISTS realtime_events ADD COLUMN IF NOT EXISTS thread_id VARCHAR",
+                "ALTER TABLE IF EXISTS realtime_events ADD COLUMN IF NOT EXISTS speaker_type VARCHAR",
+                "ALTER TABLE IF EXISTS realtime_events ADD COLUMN IF NOT EXISTS speaker_id VARCHAR",
+                "ALTER TABLE IF EXISTS realtime_events ADD COLUMN IF NOT EXISTS agent_id VARCHAR",
+                "ALTER TABLE IF EXISTS realtime_events ADD COLUMN IF NOT EXISTS agent_name VARCHAR",
+                "ALTER TABLE IF EXISTS realtime_events ADD COLUMN IF NOT EXISTS event_type VARCHAR",
+                "ALTER TABLE IF EXISTS realtime_events ADD COLUMN IF NOT EXISTS transcript_raw TEXT",
+                "ALTER TABLE IF EXISTS realtime_events ADD COLUMN IF NOT EXISTS transcript_punct TEXT",
+                "ALTER TABLE IF EXISTS realtime_events ADD COLUMN IF NOT EXISTS created_at BIGINT",
+                "ALTER TABLE IF EXISTS realtime_events ADD COLUMN IF NOT EXISTS client_event_id VARCHAR",
+                "ALTER TABLE IF EXISTS realtime_events ADD COLUMN IF NOT EXISTS meta TEXT",
+                "CREATE INDEX IF NOT EXISTS ix_realtime_events_org_slug ON realtime_events(org_slug)",
+                "CREATE INDEX IF NOT EXISTS ix_realtime_events_session_id ON realtime_events(session_id)",
+                "CREATE INDEX IF NOT EXISTS ix_realtime_events_thread_id ON realtime_events(thread_id)",
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_realtime_events_org_sess_client_eid ON realtime_events(org_slug, session_id, client_event_id)",
+            ]
+            for stmt in stmts:
+                conn.execute(text(stmt))
+
+        print("COLLAB_REALTIME_SCHEMA_BOOT_OK")
+    except Exception as e:
+        print("COLLAB_REALTIME_SCHEMA_BOOT_FAILED", str(e))
+
+
 def _reconcile_files_schema_boot():
     if ENGINE is None:
         return
@@ -497,7 +614,6 @@ def _reconcile_files_schema_boot():
             WHERE name IS NULL AND filename IS NOT NULL
             """))
 
-            # critical legacy hotfix: production DB still has files.name NOT NULL
             try:
                 conn.execute(text("ALTER TABLE IF EXISTS files ALTER COLUMN name DROP NOT NULL"))
             except Exception:
@@ -590,6 +706,7 @@ def _reconcile_files_schema_boot():
 
 _reconcile_core_auth_schema_boot()
 _reconcile_agents_schema_boot()
+_reconcile_collab_and_realtime_schema_boot()
 _reconcile_files_schema_boot()
 
 
