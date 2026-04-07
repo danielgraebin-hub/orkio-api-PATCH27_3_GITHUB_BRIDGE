@@ -497,6 +497,12 @@ def _reconcile_files_schema_boot():
             WHERE name IS NULL AND filename IS NOT NULL
             """))
 
+            # critical legacy hotfix: production DB still has files.name NOT NULL
+            try:
+                conn.execute(text("ALTER TABLE IF EXISTS files ALTER COLUMN name DROP NOT NULL"))
+            except Exception:
+                pass
+
             conn.execute(text("""
             CREATE TABLE IF NOT EXISTS file_texts (
                 id VARCHAR PRIMARY KEY,
