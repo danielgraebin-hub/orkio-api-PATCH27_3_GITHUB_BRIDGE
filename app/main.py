@@ -2733,7 +2733,7 @@ async def request_id_mw(request: Request, call_next):
     return resp
 
 @app.on_event("startup")
-def _startup():
+async def _startup():
     # Hard safety gate: JWT secret must exist.
     require_secret()
     validate_runtime_env()
@@ -2810,11 +2810,11 @@ def _startup():
             except Exception:
                 pass
         else:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                loop.create_task(start_evolution_loop(db_factory=SessionLocal, logger=logger))
-            else:
-                loop.run_until_complete(start_evolution_loop(db_factory=SessionLocal, logger=logger))
+            try:
+                logger.info("EVOLUTION_LOOP_BOOT_REQUESTED")
+            except Exception:
+                pass
+            await start_evolution_loop(db_factory=SessionLocal, logger=logger)
     except Exception as exc:
         try:
             logger.exception("EVOLUTION_LOOP_BOOT_FAIL: %s", exc)
