@@ -9,46 +9,62 @@ class RuntimePatchEngine:
         self.logger = logger
 
     async def build_patch_bundle(self, issue, decision) -> dict[str, Any]:
-        bundle = {
+        return {
             "issue": asdict(issue),
             "decision": asdict(decision),
-            "mode": "simulation-first",
+            "mode": "governed-routing",
             "proposed_actions": self._proposed_actions(issue, decision),
         }
-        return bundle
 
     def _proposed_actions(self, issue, decision) -> list[dict[str, Any]]:
         actions: list[dict[str, Any]] = []
 
         category = getattr(issue, "category", "runtime")
         code = getattr(issue, "code", "UNKNOWN")
+        details = getattr(issue, "details", {}) or {}
+        action = getattr(decision, "action", "simulate")
 
-        if category == "schema":
+        if action == "propose_schema_patch":
             actions.append(
                 {
-                    "type": "schema_reconcile_candidate",
+                    "type": "schema_patch_proposal",
                     "code": code,
-                    "safe": False,
-                    "note": "candidate only in package 01",
+                    "safe": True,
+                    "details": details,
                 }
             )
-        elif category == "realtime":
-            actions.append(
-                {
-                    "type": "realtime_guard_candidate",
-                    "code": code,
-                    "safe": False,
-                    "note": "candidate only in package 01",
-                }
-            )
-        else:
-            actions.append(
-                {
-                    "type": "runtime_investigation_candidate",
-                    "code": code,
-                    "safe": False,
-                    "note": "candidate only in package 01",
-                }
-            )
+            return actions
 
+        if action == "pr_only":
+            actions.append(
+                {
+                    "type": "manual_pr_required",
+                    "code": code,
+                    "safe": True,
+                    "details": details,
+                }
+            )
+            return actions
+
+        if action == "simulate":
+            actions.append(
+                {
+                    "type": "simulation_only",
+                    "category": category,
+                    "code": code,
+                    "safe": True,
+                    "details": details,
+                }
+            )
+            return actions
+
+        actions.append(
+            {
+                "type": "ignored",
+                "category": category,
+                "code": code,
+                "safe": True,
+                "details": details,
+            }
+        )
         return actions
