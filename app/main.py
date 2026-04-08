@@ -38,6 +38,13 @@ from .routes.internal.orion_internal import router as orion_internal_router
 from .routes.internal.git_internal import router as git_internal_router
 from .routes.internal.evolution_internal import router as evolution_internal_router
 from .routes.internal.evolution_trigger import router as evolution_trigger_router, maybe_trigger_schema_patch
+try:
+    from .self_heal import start_evolution_loop as _start_evolution_loop
+    _SELF_HEAL_IMPORT_ERROR = None
+except Exception as _self_heal_exc:
+    _start_evolution_loop = None  # type: ignore[assignment]
+    _SELF_HEAL_IMPORT_ERROR = str(_self_heal_exc)
+
 
 # Rate limit in-memory para /api/public/tts (sem Redis)
 import threading as _threading
@@ -2796,7 +2803,32 @@ def _startup():
 
     # ADMIN_API_KEY is optional. If not set, admin access is granted only via admin-role JWT.
     # (ADMIN_EMAILS controls who becomes admin on register/login.)
-    return None
+
+
+@app.on_event("startup")
+async def _startup_evolution_loop():
+    """
+    Self-healing loop bootstrap.
+    Best-effort only: it must never break API startup.
+    """
+    if _start_evolution_loop is None:
+        if _env_flag("ENABLE_EVOLUTION_LOOP", False):
+            try:
+                logger.warning(
+                    "EVOLUTION_LOOP_IMPORT_UNAVAILABLE error=%s",
+                    _SELF_HEAL_IMPORT_ERROR or "unknown",
+                )
+            except Exception:
+                pass
+        return
+
+    try:
+        await _start_evolution_loop(logger=logger)
+    except Exception as exc:
+        try:
+            logger.exception("EVOLUTION_LOOP_BOOT_FAIL: %s", exc)
+        except Exception:
+            pass
 
 
 @app.get("/")
