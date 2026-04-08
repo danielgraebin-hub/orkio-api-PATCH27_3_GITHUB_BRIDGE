@@ -138,10 +138,41 @@ class EvolutionLoop:
             return
 
         if decision.action == "propose_schema_patch":
-            self._log("EVOLUTION_LOOP_SCHEMA_PATCH_PROPOSED", issue=issue.code, bundle=bundle)
+            self._trigger_schema_patch(issue, bundle)
             return
 
         self._log("EVOLUTION_LOOP_UNKNOWN_ACTION", issue=issue.code, action=decision.action)
+
+    def _trigger_schema_patch(self, issue, bundle) -> None:
+        try:
+            from app.routes.internal.evolution_trigger import maybe_trigger_schema_patch
+        except Exception as exc:
+            self._log(
+                "EVOLUTION_PATCH_TRIGGER_IMPORT_FAIL",
+                error=repr(exc),
+                issue=issue.code,
+            )
+            return
+
+        try:
+            maybe_trigger_schema_patch(
+                issue_code=issue.code,
+                details=getattr(issue, "details", {}),
+                source="self_heal_loop",
+            )
+
+            self._log(
+                "EVOLUTION_PATCH_TRIGGER_SENT",
+                issue=issue.code,
+                details=getattr(issue, "details", {}),
+            )
+
+        except Exception as exc:
+            self._log(
+                "EVOLUTION_PATCH_TRIGGER_FAILED",
+                issue=issue.code,
+                error=repr(exc),
+            )
 
     def _log(self, message: str, **kwargs: Any) -> None:
         if self.logger:
