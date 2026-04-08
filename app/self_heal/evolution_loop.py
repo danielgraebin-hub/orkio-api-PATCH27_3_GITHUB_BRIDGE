@@ -94,25 +94,54 @@ class EvolutionLoop:
             classified = self.classifier.classify(raw_findings)
 
             for issue in classified:
-                decision = self.policy.decide(issue.severity, issue.category)
+                decision = self.policy.decide(issue.severity, issue.category, issue.code)
                 bundle = await self.patch_engine.build_patch_bundle(issue, decision)
                 validation = await self.validator.validate(decision.action, bundle)
 
-                self._log(
-                    "EVOLUTION_LOOP_DECISION",
-                    issue=issue.code,
-                    severity=issue.severity,
-                    category=issue.category,
-                    action=decision.action,
-                    validation_ok=validation.ok,
-                    details=getattr(issue, "details", {}),
-                )
+                self._route_action(issue, decision, bundle, validation, db)
         finally:
             if db is not None:
                 try:
                     db.close()
                 except Exception:
                     pass
+
+    def _route_action(self, issue, decision, bundle, validation, db=None) -> None:
+        self._log(
+            "EVOLUTION_LOOP_DECISION",
+            issue=issue.code,
+            severity=issue.severity,
+            category=issue.category,
+            action=decision.action,
+            validation_ok=validation.ok,
+            details=getattr(issue, "details", {}),
+        )
+
+        if not validation.ok:
+            self._log(
+                "EVOLUTION_LOOP_ACTION_SKIPPED",
+                issue=issue.code,
+                reason="validation_failed",
+            )
+            return
+
+        if decision.action == "ignore":
+            self._log("EVOLUTION_LOOP_IGNORED", issue=issue.code)
+            return
+
+        if decision.action == "simulate":
+            self._log("EVOLUTION_LOOP_SIMULATED", issue=issue.code, bundle=bundle)
+            return
+
+        if decision.action == "pr_only":
+            self._log("EVOLUTION_LOOP_PR_ONLY", issue=issue.code, bundle=bundle)
+            return
+
+        if decision.action == "propose_schema_patch":
+            self._log("EVOLUTION_LOOP_SCHEMA_PATCH_PROPOSED", issue=issue.code, bundle=bundle)
+            return
+
+        self._log("EVOLUTION_LOOP_UNKNOWN_ACTION", issue=issue.code, action=decision.action)
 
     def _log(self, message: str, **kwargs: Any) -> None:
         if self.logger:
