@@ -17,13 +17,28 @@ class SelfHealValidator:
     async def validate(self, action: str, payload: dict[str, Any]) -> ValidationResult:
         checks: list[dict[str, Any]] = []
 
-        # Nesta fase é propositalmente conservador.
-        # Não testa endpoints reais ainda.
         checks.append(
             {
                 "name": "simulation_mode_guard",
                 "ok": action in {"simulate", "pr_only", "apply_if_tests_pass", "auto_apply"},
                 "details": {"action": action},
+            }
+        )
+
+        checks.append(
+            {
+                "name": "patch_bundle_shape",
+                "ok": isinstance(payload, dict) and "issue" in payload and "decision" in payload,
+                "details": {"keys": sorted(list(payload.keys())) if isinstance(payload, dict) else []},
+            }
+        )
+
+        issue = payload.get("issue", {}) if isinstance(payload, dict) else {}
+        checks.append(
+            {
+                "name": "issue_has_code",
+                "ok": bool(issue.get("code")),
+                "details": {"code": issue.get("code")},
             }
         )
 
