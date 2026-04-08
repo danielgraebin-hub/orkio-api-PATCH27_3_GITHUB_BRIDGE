@@ -37,7 +37,7 @@ from .routes.internal.manus_internal import router as manus_internal_router
 from .routes.internal.orion_internal import router as orion_internal_router
 from .routes.internal.git_internal import router as git_internal_router
 from .routes.internal.evolution_internal import router as evolution_internal_router
-from .routes.internal.evolution_trigger import router as evolution_trigger_router
+from .routes.internal.evolution_trigger import router as evolution_trigger_router, maybe_trigger_schema_patch
 
 # Rate limit in-memory para /api/public/tts (sem Redis)
 import threading as _threading
@@ -2712,6 +2712,15 @@ async def request_id_mw(request: Request, call_next):
     start = time.time()
     try:
         resp = await call_next(request)
+    except Exception as e:
+        try:
+            maybe_trigger_schema_patch(
+                error_text=str(e),
+                path=request.url.path,
+            )
+        except Exception:
+            pass
+        raise
     finally:
         pass
     resp.headers["x-request-id"] = rid
