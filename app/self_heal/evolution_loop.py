@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 from contextlib import suppress
-from typing import Any
+from typing import Any, Callable
 
 from .detector import SelfHealDetector
 from .classifier import SelfHealClassifier
@@ -26,13 +26,12 @@ def _env_int(name: str, default: int) -> int:
 
 
 class EvolutionLoop:
-    def __init__(self, db=None, logger=None):
-        self.db = db
+    def __init__(self, db_factory: Callable[[], Any] | None = None, logger=None):
+        self.db_factory = db_factory
         self.logger = logger
         self.enabled = _env_bool("ENABLE_EVOLUTION_LOOP", False)
         self.interval = _env_int("EVOLUTION_LOOP_INTERVAL", 60)
 
-        self.detector = SelfHealDetector(db=db, logger=logger)
         self.classifier = SelfHealClassifier(logger=logger)
         self.policy = SelfHealPolicy(logger=logger)
         self.validator = SelfHealValidator(logger=logger)
@@ -78,28 +77,42 @@ class EvolutionLoop:
             await asyncio.sleep(self.interval)
 
     async def _tick(self) -> None:
-        findings = await self.detector.scan()
-        raw_findings = self.detector.serialize(findings)
+        db = None
+        try:
+            if self.db_factory:
+                db = self.db_factory()
 
-        if not raw_findings:
-            self._log("EVOLUTION_LOOP_NO_FINDINGS")
-            return
+            detector = SelfHealDetector(db=db, logger=self.logger)
 
-        classified = self.classifier.classify(raw_findings)
+            findings = await detector.scan()
+            raw_findings = detector.serialize(findings)
 
-        for issue in classified:
-            decision = self.policy.decide(issue.severity, issue.category)
-            bundle = await self.patch_engine.build_patch_bundle(issue, decision)
-            validation = await self.validator.validate(decision.action, bundle)
+            if not raw_findings:
+                self._log("EVOLUTION_LOOP_NO_FINDINGS")
+                return
 
-            self._log(
-                "EVOLUTION_LOOP_DECISION",
-                issue=issue.code,
-                severity=issue.severity,
-                category=issue.category,
-                action=decision.action,
-                validation_ok=validation.ok,
-            )
+            classified = self.classifier.classify(raw_findings)
+
+            for issue in classified:
+                decision = self.policy.decide(issue.severity, issue.category)
+                bundle = await self.patch_engine.build_patch_bundle(issue, decision)
+                validation = await self.validator.validate(decision.action, bundle)
+
+                self._log(
+                    "EVOLUTION_LOOP_DECISION",
+                    issue=issue.code,
+                    severity=issue.severity,
+                    category=issue.category,
+                    action=decision.action,
+                    validation_ok=validation.ok,
+                    details=getattr(issue, "details", {}),
+                )
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
 
     def _log(self, message: str, **kwargs: Any) -> None:
         if self.logger:
@@ -115,11 +128,11 @@ class EvolutionLoop:
 _loop_singleton: EvolutionLoop | None = None
 
 
-async def start_evolution_loop(db=None, logger=None) -> EvolutionLoop:
+async def start_evolution_loop(db_factory=None, logger=None) -> EvolutionLoop:
     global _loop_singleton
 
     if _loop_singleton is None:
-        _loop_singleton = EvolutionLoop(db=db, logger=logger)
+        _loop_singleton = EvolutionLoop(db_factory=db_factory, logger=logger)
 
     await _loop_singleton.start()
     return _loop_singleton
