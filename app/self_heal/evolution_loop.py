@@ -1,5 +1,9 @@
+from __future__ import annotations
+
 import asyncio
 import os
+
+from app.self_heal.frontend_guard import guard as frontend_guard
 
 
 class EvolutionLoop:
@@ -25,6 +29,16 @@ class EvolutionLoop:
                 self.logger.warning("SELF_HEAL_CLASSIFIER_READY")
                 self.logger.warning("SELF_HEAL_POLICY_READY")
                 self.logger.warning("SELF_HEAL_VALIDATOR_READY")
+
+                try:
+                    frontend_guard.analyze_contract_mismatch(
+                        endpoint="realtime_stream",
+                        expected_schema={"transcript": "string"},
+                        received_schema={"transcript": "string"},
+                    )
+                except Exception:
+                    pass
+
             except Exception:
                 pass
 
