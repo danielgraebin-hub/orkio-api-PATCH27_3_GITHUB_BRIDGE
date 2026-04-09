@@ -48,6 +48,7 @@ _GITHUB_KEYWORDS = (
     "repositório",
     "repositorio",
     "branch",
+    "ramo",
     "commit",
     "pull request",
     "pr ",
@@ -55,6 +56,9 @@ _GITHUB_KEYWORDS = (
     "file ",
     "código",
     "codigo",
+    "crie",
+    "criar",
+    "novo arquivo",
 )
 
 
@@ -136,6 +140,57 @@ def _extract_search_query(message: str) -> Optional[str]:
     if m:
         return m.group(1).strip()[:180]
     return None
+
+
+
+
+def _extract_content_literal(message: str) -> Optional[str]:
+    s = message or ""
+    code_blocks = re.findall(r"```(?:[a-zA-Z0-9_+-]+)?\n([\s\S]*?)```", s)
+    if code_blocks:
+        return code_blocks[0].strip()
+
+    quoted = re.search(r'conte[uú]do\s*[:=]\s*"([\s\S]+)"', s, flags=re.IGNORECASE)
+    if quoted:
+        return quoted.group(1).strip()
+    quoted = re.search(r"conte[uú]do\s*[:=]\s*'([\s\S]+)'", s, flags=re.IGNORECASE)
+    if quoted:
+        return quoted.group(1).strip()
+
+    m = re.search(r'com\s+conte[uú]do\s+"([\s\S]+)"', s, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r"com\s+conte[uú]do\s+'([\s\S]+)'", s, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+
+    m = re.search(r'com\s+conte[uú]do\s*[:=]?\s*([\s\S]+)$', s, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+def _extract_branch_create_name(message: str) -> Optional[str]:
+    s = message or ""
+    patterns = [
+        r"(?:crie|criar|abra|gerar)\s+(?:uma\s+)?branch\s+(?:chamada\s+)?([A-Za-z0-9_./\-]{2,120})",
+        r"(?:crie|criar|abra|gerar)\s+(?:um\s+)?ramo\s+(?:chamado\s+)?([A-Za-z0-9_./\-]{2,120})",
+    ]
+    for pat in patterns:
+        m = re.search(pat, s, flags=re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+def _looks_like_create_branch(message: str) -> bool:
+    low = (message or "").lower()
+    return ("branch" in low or "ramo" in low) and any(k in low for k in ("crie", "criar", "abra", "gerar"))
+
+
+def _looks_like_create_file(message: str) -> bool:
+    low = (message or "").lower()
+    return any(k in low for k in ("crie", "criar", "novo arquivo", "adicione arquivo")) and any(k in low for k in ("arquivo", "file"))
 
 
 def resolve_orion_github_operation(message: str) -> Dict[str, Any]:
@@ -227,6 +282,27 @@ def execute_orion_single_file_fix(payload: OrionGitWriteIn) -> Dict[str, Any]:
         "path": payload.path,
         "commit": commit_result,
         "pull_request": pr_result,
+    }
+
+
+
+
+def execute_orion_branch_create(*, branch_name: str, source_branch: Optional[str] = None) -> Dict[str, Any]:
+    if not (branch_name or "").strip():
+        raise HTTPException(status_code=400, detail="branch_name required")
+    data = git_create_branch(
+        BranchCreateIn(
+            branch_name=branch_name.strip(),
+            source_branch=(source_branch or _env("GITHUB_BRANCH", "main") or "main").strip(),
+        )
+    )
+    return {
+        "ok": True,
+        "repo": _env("GITHUB_REPO"),
+        "source_branch": data.get("source_branch"),
+        "branch": data.get("new_branch"),
+        "ref": data.get("ref"),
+        "sha": data.get("sha"),
     }
 
 
