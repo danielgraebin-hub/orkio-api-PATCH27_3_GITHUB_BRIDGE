@@ -16,6 +16,8 @@ CAPABILITY_REGISTRY = {
             "technical_analysis",
             "github_repo_read",
             "github_repo_fix",
+            "github_branch_create",
+            "github_file_create",
             "governed_patch_execution",
         ],
         "triggers": ["github", "repo", "code", "patch", "fix", "technical"],
@@ -75,3 +77,4 @@ CAPABILITY_REGISTRY = {
 
 def get_capability_registry():
     return CAPABILITY_REGISTRY.copy()
+
