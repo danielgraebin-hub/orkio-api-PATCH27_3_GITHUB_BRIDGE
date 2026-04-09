@@ -2819,7 +2819,7 @@ async def _startup():
                 pass
 
             await start_evolution_loop(
-                db_factory=SessionLocal,
+                db_factory=lambda: SessionLocal(),
                 logger=logger,
             )
     except Exception as exc:
