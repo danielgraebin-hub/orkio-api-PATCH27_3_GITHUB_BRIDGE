@@ -39,8 +39,12 @@ from .routes.internal.git_internal import router as git_internal_router
 from .routes.internal.evolution_internal import router as evolution_internal_router
 from .routes.internal.evolution_trigger import router as evolution_trigger_router, maybe_trigger_schema_patch
 
+import importlib
+
 try:
-    from app.self_heal.evolution_loop import start_evolution_loop
+    start_evolution_loop = importlib.import_module(
+        "app.self_heal.evolution_loop"
+    ).start_evolution_loop
 except Exception:
     start_evolution_loop = None  # type: ignore
 
