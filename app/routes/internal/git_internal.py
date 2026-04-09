@@ -133,7 +133,11 @@ def git_health():
 def git_tree(branch: Optional[str] = Query(default=None)):
     branch_name = _branch(branch)
     commit_sha = _get_ref_sha(branch_name)
-    data = _request("GET", f"/repos/{_repo()}/git/trees/{commit_sha}", params={"recursive": "1"})
+    data = _request(
+        "GET",
+        f"/repos/{_repo()}/git/trees/{commit_sha}",
+        params={"recursive": "1"},
+    )
     return {
         "repo": _repo(),
         "branch": branch_name,
@@ -195,6 +199,7 @@ def git_create_branch(payload: BranchCreateIn):
     source_branch = _branch(payload.source_branch)
     base_sha = _get_ref_sha(source_branch)
     ref = f"refs/heads/{payload.branch_name}"
+
     data = _request(
         "POST",
         f"/repos/{_repo()}/git/refs",
@@ -203,6 +208,7 @@ def git_create_branch(payload: BranchCreateIn):
             "sha": base_sha,
         },
     )
+
     return {
         "ok": True,
         "source_branch": source_branch,
@@ -217,11 +223,17 @@ def git_commit_file(payload: CommitFileIn):
     branch_name = _branch(payload.branch)
 
     existing_sha = None
+    file_preexisted = False
+
     try:
         existing = _get_file(payload.path, branch_name)
         existing_sha = existing.get("sha")
+        file_preexisted = True
     except HTTPException as e:
-        if e.status_code != 404:
+        if e.status_code == 404:
+            existing_sha = None
+            file_preexisted = False
+        else:
             raise
 
     encoded = base64.b64encode(payload.content.encode("utf-8")).decode("utf-8")
@@ -234,15 +246,22 @@ def git_commit_file(payload: CommitFileIn):
     if existing_sha:
         body["sha"] = existing_sha
 
-    data = _request("PUT", f"/repos/{_repo()}/contents/{payload.path}", json_body=body)
+    data = _request(
+        "PUT",
+        f"/repos/{_repo()}/contents/{payload.path}",
+        json_body=body,
+    )
 
     commit = data.get("commit", {}) or {}
     content = data.get("content", {}) or {}
 
     return {
         "ok": True,
+        "repo": _repo(),
         "branch": branch_name,
         "path": payload.path,
+        "created": not file_preexisted,
+        "updated": file_preexisted,
         "content_sha": content.get("sha"),
         "commit_sha": commit.get("sha"),
         "commit_url": commit.get("html_url"),
