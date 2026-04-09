@@ -38,6 +38,7 @@ from .routes.internal.orion_internal import (
     router as orion_internal_router,
     OrionGitWriteIn,
     create_orion_branch_name,
+    execute_orion_branch_create,
     execute_orion_single_file_fix,
     has_explicit_patch_approval,
     has_github_intent as orion_has_github_intent,
@@ -4289,21 +4290,84 @@ def _maybe_handle_orion_github_request(
                 "meta": {"github": facts, "kind": kind, "mode": "read"},
             }
 
-        if kind == "write_fix":
+        if kind == "create_branch":
+            branch_name = str(op.get("branch_name") or "").strip()
+            source_branch = str(op.get("source_branch") or os.getenv("GITHUB_BRANCH", "main")).strip() or "main"
+            if not branch_name:
+                return {
+                    "handled": True,
+                    "text": "Para criar uma branch no GitHub eu preciso do nome da branch, por exemplo `test-runtime-access`.",
+                    "usage": None,
+                    "model": "orion_github_bridge",
+                    "meta": {"kind": kind, "mode": "missing_branch_name"},
+                }
+
+            if not _user_can_govern_internal_changes(user) or not has_explicit_patch_approval(message):
+                return {
+                    "handled": True,
+                    "text": (
+                        f"Posso criar a branch `{branch_name}` a partir de `{source_branch}`, "
+                        "mas aguardo seu 'de acordo' para executar no GitHub."
+                    ),
+                    "usage": None,
+                    "model": "orion_github_bridge",
+                    "meta": {"kind": kind, "mode": "approval_required", "branch": branch_name, "source_branch": source_branch},
+                }
+
+            created = execute_orion_branch_create(branch_name=branch_name, source_branch=source_branch)
+            return {
+                "handled": True,
+                "text": (
+                    f"Branch criada no GitHub com sucesso: `{created.get('branch')}` "
+                    f"a partir de `{created.get('source_branch')}`."
+                ),
+                "usage": None,
+                "model": "orion_github_bridge",
+                "meta": {"github": created, "kind": kind, "mode": "branch_created"},
+            }
+
+        if kind in ("write_fix", "create_file"):
             path = str(op.get("path") or "").strip()
             if not path:
                 return {
                     "handled": True,
-                    "text": "Para aplicar uma correção no GitHub eu preciso do caminho do arquivo, por exemplo `app/main.py` ou `src/routes/AppConsole.jsx`.",
+                    "text": "Para escrever no GitHub eu preciso do caminho do arquivo, por exemplo `app/main.py` ou `docs/test_runtime.txt`.",
                     "usage": None,
                     "model": "orion_github_bridge",
                     "meta": {"kind": kind, "mode": "write_missing_path"},
                 }
 
-            file_payload = dict(run_orion_github_read({"kind": "file", "path": path, "branch": op.get("branch")}))
-            file_payload["kind"] = "file"
+            file_exists = True
+            file_payload: Dict[str, Any] = {"path": path, "branch": op.get("branch")}
+            try:
+                file_payload = dict(run_orion_github_read({"kind": "file", "path": path, "branch": op.get("branch")}))
+                file_payload["kind"] = "file"
+            except HTTPException as e:
+                if e.status_code == 404 and kind == "create_file":
+                    file_exists = False
+                    file_payload = {
+                        "repo": os.getenv("GITHUB_REPO", ""),
+                        "branch": op.get("branch") or os.getenv("GITHUB_BRANCH", "main"),
+                        "path": path,
+                        "content": "",
+                        "kind": "file_missing",
+                    }
+                else:
+                    raise
 
             if not _user_can_govern_internal_changes(user) or not has_explicit_patch_approval(message):
+                if kind == "create_file":
+                    return {
+                        "handled": True,
+                        "text": (
+                            f"Posso criar o arquivo `{path}` no GitHub, "
+                            "mas aguardo seu 'de acordo' para executar."
+                        ),
+                        "usage": None,
+                        "model": "orion_github_bridge",
+                        "meta": {"github": file_payload, "kind": kind, "mode": "approval_required"},
+                    }
+
                 overlay = (
                     "Você é Orion com leitura real do GitHub. "
                     "Analise o arquivo real abaixo e explique, em linguagem objetiva, "
@@ -4334,16 +4398,55 @@ def _maybe_handle_orion_github_request(
                     "meta": {"github": file_payload, "kind": kind, "mode": "analysis_only"},
                 }
 
+            if kind == "create_file":
+                raw_content = str(op.get("content") or "").strip()
+                if not raw_content:
+                    return {
+                        "handled": True,
+                        "text": (
+                            f"Para criar `{path}` eu preciso do conteúdo do arquivo. "
+                            "Exemplo: @Orion crie `docs/test_runtime.txt` com conteúdo \"runtime ok\"."
+                        ),
+                        "usage": None,
+                        "model": "orion_github_bridge",
+                        "meta": {"kind": kind, "mode": "missing_content"},
+                    }
+                commit_message = f"Orion governed create: {path}"
+                write_result = execute_orion_single_file_fix(
+                    OrionGitWriteIn(
+                        path=path,
+                        content=raw_content,
+                        commit_message=commit_message,
+                        base_branch=op.get("branch"),
+                        open_pr=True,
+                    )
+                )
+                pr = write_result.get("pull_request") or {}
+                pr_url = pr.get("url")
+                text = (
+                    f"Arquivo criado no GitHub: `{path}`. Branch criada: {write_result.get('branch')}. "
+                    + (f"PR aberto: {pr_url}. " if pr_url else "PR não foi aberto automaticamente. ")
+                    + "A ação foi executada sob sua aprovação explícita."
+                )
+                return {
+                    "handled": True,
+                    "text": text,
+                    "usage": None,
+                    "model": "orion_github_bridge",
+                    "meta": {"github": write_result, "kind": kind, "mode": "write_executed"},
+                }
+
             rewrite_overlay = (
                 "Você é Orion, CTO da plataforma. "
                 "Reescreva o arquivo inteiro abaixo aplicando APENAS as correções pedidas pelo fundador. "
                 "Preserve imports, contratos e estilo existentes quando possível. "
                 "Retorne SOMENTE um bloco de código completo cercado por triple backticks, sem explicações extras."
             )
+            current_content = file_payload.get('content') or ''
             rewrite_obj = _openai_answer(
                 user_message=(
                     f"Instrução do fundador:\n{message}\n\n"
-                    f"Arquivo atual ({path})\n```\n{_truncate_for_prompt(file_payload.get('content') or '', 28000)}\n```"
+                    f"Arquivo atual ({path})\n```\n{_truncate_for_prompt(current_content, 28000)}\n```"
                 ),
                 context_chunks=[],
                 history=None,
