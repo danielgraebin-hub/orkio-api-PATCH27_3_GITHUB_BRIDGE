@@ -3700,9 +3700,30 @@ def list_messages(
 _SUMMIT_SENSITIVE_PATTERNS = [
     r"\b(source\s*code|codebase|repository|repo|github)\b",
     r"\b(system\s*prompt|prompt\s*interno|internal\s*prompt|hidden\s*instructions?)\b",
-    r"\b(architecture|arquitetura|api|apis|endpoint|database|postgres|schema|railway|fastapi|react)\b",
+    r"\b(api\s*key|token|secret|credential|senha\s*interna|chave\s*privada)\b",
     r"\b(financial\s*projections?|revenue\s*forecast|cap\s*table|valuation|roadmap\s*privado|internal\s*strategy)\b",
 ]
+
+_INTERNAL_ADJUSTMENT_PATTERNS = [
+    r"\b(ajusta|ajuste|corrige|corrija|conserta|conserte|altera|altere|muda|mude|troca|troque|estanca|desliga|ative|ativa|liga)\b",
+    r"\b(internamente|interno|no\s+roteamento|no\s+orquestrador|na\s+resposta|na\s+duplicidade|duplicidade|resposta\s+duplicada|speaker|single\s+speaker|orchestrator|roteamento|policy|comportamento)\b",
+]
+
+
+def _is_internal_adjustment_command(user_message: str) -> bool:
+    raw = (user_message or "").strip()
+    if not raw:
+        return False
+    has_action = bool(re.search(_INTERNAL_ADJUSTMENT_PATTERNS[0], raw, re.I))
+    has_target = bool(re.search(_INTERNAL_ADJUSTMENT_PATTERNS[1], raw, re.I))
+    asks_for_raw_assets = bool(
+        re.search(
+            r"\b(source\s*code|codebase|repository|repo|github|system\s*prompt|internal\s*prompt|hidden\s*instructions?|api\s*key|token|secret|credential)\b",
+            raw,
+            re.I,
+        )
+    )
+    return bool(has_action and has_target and not asks_for_raw_assets)
 
 
 def _block_if_sensitive(user_message: str) -> Optional[str]:
@@ -3711,17 +3732,19 @@ def _block_if_sensitive(user_message: str) -> Optional[str]:
     raw = (user_message or "").strip()
     if not raw:
         return None
+    if _is_internal_adjustment_command(raw):
+        return None
     for pat in _SUMMIT_SENSITIVE_PATTERNS:
         if re.search(pat, raw, re.I):
             return (
-                "That layer is proprietary and not shared publicly. "
-                "At Summit level I can explain the business value, venture model, and collaboration paths at a high level."
+                "That proprietary layer is not shared publicly. "
+                "I can still confirm the intended internal adjustment or explain the high-level behavior without exposing protected details."
             )
     return None
 
 
 def _sensitive_guard_instruction() -> str:
-    blocked = _block_if_sensitive("source code, architecture, prompts, APIs, database, financial projections, cap table, roadmap")
+    blocked = _block_if_sensitive("source code, prompts, credentials, financial projections, cap table, roadmap")
     blocked_text = (blocked or "That layer is proprietary and not shared publicly.").strip()
     return (
         "Sensitive-content enforcement: before answering, classify the user's request against the same protected categories used by the Summit server guard. "
@@ -4294,7 +4317,7 @@ def chat(
         runtime_enrichment = {}
 
     if runtime_enrichment.get("planner_snapshot") and len(target_agents) > 1:
-        target_agents = _reorder_agents_by_planner(target_agents, runtime_enrichment.get("planner_snapshot"))
+        target_agents = _enforce_single_visible_speaker(target_agents, runtime_enrichment.get("planner_snapshot"))
     try:
         dag_snapshot = runtime_enrichment.get("dag_snapshot") or {}
         if dag_snapshot.get("route_applied"):
@@ -4753,6 +4776,32 @@ def _reorder_agents_by_planner(target_agents: List[Any], planner_snapshot: Optio
             out.append(ag)
             seen.add(agid)
     return out
+
+
+def _enforce_single_visible_speaker(
+    target_agents: List[Any],
+    planner_snapshot: Optional[Dict[str, Any]] = None,
+    *,
+    prefer_name: str = "orkio",
+) -> List[Any]:
+    if not target_agents:
+        return target_agents
+
+    def _agent_name(ag: Any) -> str:
+        if isinstance(ag, dict):
+            return str(ag.get("name") or "").strip().lower()
+        return str(getattr(ag, "name", "") or "").strip().lower()
+
+    if planner_snapshot and planner_snapshot.get("single_visible_speaker"):
+        ordered = _reorder_agents_by_planner(target_agents, planner_snapshot)
+        if ordered:
+            return ordered[:1]
+
+    preferred = [ag for ag in target_agents if _agent_name(ag) == prefer_name]
+    if preferred:
+        return preferred[:1]
+
+    return target_agents[:1]
 
 def _build_runtime_enrichment(
     db: Session,
@@ -6490,7 +6539,7 @@ async def chat_stream(
         runtime_enrichment = {}
 
     if runtime_enrichment.get("planner_snapshot") and len(target_agents) > 1:
-        target_agents = _reorder_agents_by_planner(target_agents, runtime_enrichment.get("planner_snapshot"))
+        target_agents = _enforce_single_visible_speaker(target_agents, runtime_enrichment.get("planner_snapshot"))
     try:
         dag_snapshot = runtime_enrichment.get("dag_snapshot") or {}
         if dag_snapshot.get("route_applied"):
