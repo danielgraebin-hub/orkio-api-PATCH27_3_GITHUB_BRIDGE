@@ -9,6 +9,20 @@ CAPABILITY_REGISTRY = {
         "priority": 100,
         "writes_memory": False,
     },
+
+    "orion": {
+        "role": "cto",
+        "capabilities": [
+            "technical_analysis",
+            "github_repo_read",
+            "github_repo_fix",
+            "governed_patch_execution",
+        ],
+        "triggers": ["github", "repo", "code", "patch", "fix", "technical"],
+        "dependencies": ["orkio"],
+        "priority": 98,
+        "writes_memory": False,
+    },
     "miguel": {
         "role": "guardian",
         "capabilities": ["risk_guard", "safety_boundary", "sensitive_review"],
