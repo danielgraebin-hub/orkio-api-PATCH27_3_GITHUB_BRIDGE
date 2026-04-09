@@ -5,7 +5,7 @@ from typing import Dict, Any
 from app.self_heal.scaffold_engine import scaffold_engine
 
 
-logger = logging.getLogger(_name_)
+logger = logging.getLogger(__name__)
 
 
 class CodeEmitterEngine:
