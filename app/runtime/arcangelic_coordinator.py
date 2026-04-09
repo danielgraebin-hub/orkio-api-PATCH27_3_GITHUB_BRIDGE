@@ -8,21 +8,38 @@ def build_arcangelic_chain(
     profile_hints: Dict[str, Any] | None,
     capability_registry: Dict[str, Any],
 ) -> Dict[str, Any]:
-    recommended = list(intent_package.get("recommended_agents") or [])
-    execution: List[Dict[str, Any]] = []
-    for name in recommended:
-        cap = capability_registry.get(name, {})
-        mode = "concise"
+    visible_responder = "orkio"
+    advisors = [str(x).strip().lower() for x in (intent_package.get("advisor_agents") or []) if x]
+    if not advisors:
+        advisors = [
+            str(x).strip().lower()
+            for x in (intent_package.get("recommended_agents") or [])
+            if x and str(x).strip().lower() != visible_responder
+        ]
+
+    visible_cap = capability_registry.get(visible_responder, {}) or {}
+    execution: List[Dict[str, Any]] = [{
+        "agent": visible_responder,
+        "task": (visible_cap.get("capabilities") or ["guide"])[0],
+        "mode": "orchestrator",
+        "visible": True,
+    }]
+
+    internal_advisors: List[Dict[str, Any]] = []
+    for name in advisors:
+        cap = capability_registry.get(name, {}) or {}
+        mode = "internal_advisor"
         if name == "rafael":
-            mode = "supportive"
+            mode = "supportive_internal"
         elif name == "gabriel":
-            mode = "translator"
-        elif name == "orkio":
-            mode = "orchestrator"
-        execution.append({
+            mode = "translator_internal"
+        elif name == "orion":
+            mode = "technical_internal"
+        internal_advisors.append({
             "agent": name,
             "task": (cap.get("capabilities") or ["guide"])[0],
             "mode": mode,
+            "visible": False,
         })
 
     sensitivity = (intent_package.get("sensitivity_level") or "low").lower()
@@ -32,8 +49,11 @@ def build_arcangelic_chain(
     return {
         "chain_type": intent_package.get("intent") or "general_guidance",
         "pre_guard": pre_guard,
-        "orchestrator": "orkio",
+        "orchestrator": visible_responder,
+        "visible_responder": visible_responder,
+        "single_visible_speaker": True,
         "execution_sequence": execution,
+        "internal_advisors": internal_advisors,
         "post_guard": None,
         "scribe": scribe,
         "final_response_style": "clear_and_structured",
@@ -45,6 +65,7 @@ def build_system_overlay(intent_package: Dict[str, Any], first_win_plan: Dict[st
     questions = first_win_plan.get("questions") or []
     qtxt = "\n".join([f"- {q}" for q in questions[:2]])
     resume_hint = continuity_hints.get("resume_hint") or ""
+    advisor_names = ", ".join([str(x.get("agent") or "") for x in (chain.get("internal_advisors") or []) if x.get("agent")]) or "none"
     return (
         "Runtime guidance for this response:\n"
         f"- dominant_intent: {intent_package.get('intent')}\n"
@@ -53,16 +74,17 @@ def build_system_overlay(intent_package: Dict[str, Any], first_win_plan: Dict[st
         f"- followup_mode: {chain.get('followup_mode')}\n"
         f"- resume_hint: {resume_hint}\n"
         f"- final_response_style: {chain.get('final_response_style')}\n"
+        f"- visible_responder: {chain.get('visible_responder') or chain.get('orchestrator')}\n"
+        f"- internal_advisors: {advisor_names}\n"
         "Instructions:\n"
-        "1. Start with clear orientation tied to the user's current moment.\n"
-        "2. Prefer one concrete next step over abstract explanation.\n"
-        "3. If helpful, ask at most two targeted questions that unlock a first win.\n"
-        "4. Keep continuity natural, not forced.\n"
-        "5. Do not mention internal engines, guards, or chain names.\n"
-        "6. SELF-SELL: At the end of your response, naturally suggest ONE next step the user could take "
-        "with you or another agent (e.g., 'Want me to ask Chris to run the financial projections on this?' "
-        "or 'I can orchestrate the full team to build a plan around this — just say @Team.'). "
-        "Keep it brief, helpful, and non-pushy. Reveal capabilities progressively.\n"
+        "1. Only the visible responder may speak directly to the user.\n"
+        "2. Use internal advisors silently to improve the answer, but do not output advisor names or parallel replies.\n"
+        "3. If the user requests an internal adjustment or correction, acknowledge the action plainly and state what will be adjusted internally.\n"
+        "4. Prefer one concrete next step over abstract explanation.\n"
+        "5. If helpful, ask at most two targeted questions that unlock a first win.\n"
+        "6. Keep continuity natural, not forced.\n"
+        "7. Do not mention internal engines, guards, routing modes, or chain names.\n"
+        "8. Do not claim lack of access to your own code or inability to adjust internal behavior; instead, describe the intended internal adjustment at a high level without exposing proprietary details.\n"
         f"Suggested first-win questions:\n{qtxt}"
     )
 
@@ -84,6 +106,8 @@ def build_runtime_hints(
         "resume_hint": continuity_hints.get("resume_hint"),
         "followup_target": continuity_hints.get("followup_target"),
         "numerology_invite_window": bool(chain.get("numerology_invite_window")),
+        "visible_responder": chain.get("visible_responder") or chain.get("orchestrator"),
+        "single_visible_speaker": bool(chain.get("single_visible_speaker")),
     }
     if planner_snapshot:
         out["planner"] = {
