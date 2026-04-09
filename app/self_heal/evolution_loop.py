@@ -4,6 +4,8 @@ import asyncio
 import os
 
 from app.self_heal.frontend_guard import guard as frontend_guard
+from app.self_heal.capability_planner import planner
+import app.self_heal.capabilities_bootstrap  # noqa: F401
 
 
 class EvolutionLoop:
@@ -36,6 +38,11 @@ class EvolutionLoop:
                         expected_schema={"transcript": "string"},
                         received_schema={"transcript": "string"},
                     )
+                except Exception:
+                    pass
+
+                try:
+                    planner.build_execution_plan("self_knowledge_app")
                 except Exception:
                     pass
 
