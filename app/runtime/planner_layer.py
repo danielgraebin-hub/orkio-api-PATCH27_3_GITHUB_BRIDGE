@@ -88,12 +88,13 @@ def build_planner_snapshot(
     route_override = execution_order != baseline_order
     return {
         "planner_version": "v3-lite-supervisor",
-        "routing_mode": "capability_guided",
+        "routing_mode": "orchestrator_priority",
         "routing_source": "planner" if route_override else "default",
-        "routing_override_reason": "capability_priority" if route_override else "",
+        "routing_override_reason": "orchestrator_priority" if route_override else "",
         "primary_objective": objective,
         "stop_condition": "first_win_or_clear_next_step",
-        "execution_strategy": "sequential_supervised",
+        "execution_strategy": "single_visible_speaker",
+        "single_visible_speaker": True,
         "fallback_strategy": "single_path_json_fallback",
         "parallelizable_nodes": [],
         "confidence_threshold": 0.67,
