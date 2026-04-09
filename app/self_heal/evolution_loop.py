@@ -40,7 +40,12 @@ class EvolutionLoop:
     def __init__(self, db_factory: Callable[[], Any] | None = None, logger=None):
         self.db_factory = db_factory
         self.logger = logger
-        self.enabled = _env_bool("ENABLE_EVOLUTION_LOOP", False)
+
+        raw_enabled = os.getenv("ENABLE_EVOLUTION_LOOP", None)
+        parsed_enabled = _env_bool("ENABLE_EVOLUTION_LOOP", False)
+        force_enabled = _env_bool("FORCE_ENABLE_EVOLUTION_LOOP", False)
+
+        self.enabled = bool(parsed_enabled or force_enabled)
         self.interval = _env_int("EVOLUTION_LOOP_INTERVAL", 60)
 
         self.classifier = SelfHealClassifier(logger=logger)
@@ -51,9 +56,18 @@ class EvolutionLoop:
         self._task: asyncio.Task | None = None
         self._running = False
 
+        self._log(
+            "EVOLUTION_LOOP_CONFIG",
+            raw_enable_value=raw_enabled,
+            parsed_enable_value=parsed_enabled,
+            force_enable_value=force_enabled,
+            final_enabled=self.enabled,
+            interval=self.interval,
+        )
+
     async def start(self) -> None:
         if not self.enabled:
-            self._log("EVOLUTION_LOOP_DISABLED")
+            self._log("EVOLUTION_LOOP_DISABLED", interval=self.interval)
             return
 
         if self._running:
