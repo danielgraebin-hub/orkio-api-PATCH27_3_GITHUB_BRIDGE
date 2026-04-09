@@ -1,18 +1,28 @@
+from __future__ import annotations
+
 import time
+from typing import Dict
 
 
 class RealtimeDuplicationGuard:
+    """Simple in-memory dedupe guard for realtime final commits.
 
-    def __init__(self):
-        self.last_commit_ts = {}
-        self.window_ms = 1200
+    It prevents multiple final commits from the same session inside a short window.
+    Process-local only, which is enough for the current Railway single-process runtime.
+    """
+
+    def __init__(self, window_ms: int = 1200):
+        self.last_commit_ts: Dict[str, int] = {}
+        self.window_ms = int(window_ms)
 
     def should_commit(self, session_id: str) -> bool:
-        now = int(time.time() * 1000)
+        if not session_id:
+            return True
 
+        now = int(time.time() * 1000)
         last = self.last_commit_ts.get(session_id)
 
-        if last and (now - last) < self.window_ms:
+        if last is not None and (now - last) < self.window_ms:
             return False
 
         self.last_commit_ts[session_id] = now
