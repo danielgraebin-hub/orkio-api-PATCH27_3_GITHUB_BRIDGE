@@ -34,7 +34,17 @@ from .numerology.schemas import NumerologyProfileIn, NumerologyProfileOut
 from .numerology.engine import generate_numerology_profile
 from .routes.user import router as user_router
 from .routes.internal.manus_internal import router as manus_internal_router
-from .routes.internal.orion_internal import router as orion_internal_router
+from .routes.internal.orion_internal import (
+    router as orion_internal_router,
+    OrionGitWriteIn,
+    create_orion_branch_name,
+    execute_orion_single_file_fix,
+    has_explicit_patch_approval,
+    has_github_intent as orion_has_github_intent,
+    is_orion_agent_name,
+    resolve_orion_github_operation,
+    run_orion_github_read,
+)
 from .routes.internal.git_internal import router as git_internal_router
 from .routes.internal.evolution_internal import router as evolution_internal_router
 from .routes.internal.evolution_trigger import router as evolution_trigger_router, maybe_trigger_schema_patch
@@ -227,8 +237,6 @@ MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "20"))
 SUMMIT_MODE = os.getenv("SUMMIT_MODE", "false").strip().lower() in ("1", "true")
 SUMMIT_AGENT_ID = os.getenv("SUMMIT_AGENT_ID", "").strip()
 SUMMIT_EXPIRES_AT = int(os.getenv("SUMMIT_EXPIRES_AT", "1775087999"))  # 2026-04-01 23:59:59 UTC
-CONTROLLED_EVOLUTION_OVERLAY_ENABLED = os.getenv("CONTROLLED_EVOLUTION_OVERLAY_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
-REQUIRE_EXPLICIT_DEPLOY_APPROVAL = os.getenv("REQUIRE_EXPLICIT_DEPLOY_APPROVAL", "true").strip().lower() in ("1", "true", "yes", "on")
 # Summit access window enforcement (standard users only)
 def _summit_access_expired(payload_or_user: Any) -> bool:
     """Return True if Summit access window is expired for a summit_standard (non-admin) user."""
@@ -2819,23 +2827,15 @@ async def _startup():
             except Exception:
                 pass
         else:
-            evolution_enabled = os.getenv("ENABLE_EVOLUTION_LOOP", "false").strip().lower() in ("1", "true", "yes", "on")
-            force_enabled = os.getenv("FORCE_ENABLE_EVOLUTION_LOOP", "false").strip().lower() in ("1", "true", "yes", "on")
-            if not (evolution_enabled or force_enabled):
-                try:
-                    logger.warning("EVOLUTION_LOOP_BOOT_SKIPPED approval_gate=env_disabled")
-                except Exception:
-                    pass
-            else:
-                try:
-                    logger.warning("EVOLUTION_LOOP_BOOT_REQUESTED")
-                except Exception:
-                    pass
+            try:
+                logger.warning("EVOLUTION_LOOP_BOOT_REQUESTED")
+            except Exception:
+                pass
 
-                await start_evolution_loop(
-                    db_factory=lambda: SessionLocal(),
-                    logger=logger,
-                )
+            await start_evolution_loop(
+                db_factory=lambda: SessionLocal(),
+                logger=logger,
+            )
     except Exception as exc:
         try:
             logger.exception("EVOLUTION_LOOP_BOOT_FAIL: %s", exc)
@@ -3736,149 +3736,6 @@ def _is_internal_adjustment_command(user_message: str) -> bool:
     return bool(has_action and has_target and not asks_for_raw_assets)
 
 
-_APPROVAL_TERMS = (
-    "de acordo",
-    "autorizado",
-    "autorizada",
-    "aprovado",
-    "aprovada",
-    "pode seguir",
-    "ok executar",
-    "ok, executar",
-    "liberado",
-)
-_PATCH_SCOPE_TERMS = (
-    "patch",
-    "ajuste",
-    "ajustar",
-    "correção",
-    "corrigir",
-    "interno",
-    "staging",
-    "sem deploy",
-    "sem promover",
-)
-_DEPLOY_SCOPE_TERMS = (
-    "deploy",
-    "produção",
-    "producao",
-    "promover",
-    "production",
-)
-_INTERNAL_EXECUTION_TERMS = (
-    "ajuste interno",
-    "correção interna",
-    "internal adjustment",
-    "behavior fix",
-    "routing adjustment",
-    "response-policy change",
-    "self-heal",
-    "auto evolução",
-    "autoevolução",
-    "evolução assistida",
-    "evolucao assistida",
-)
-
-
-def _is_admin_like(user_obj: Any) -> bool:
-    try:
-        role = (user_obj.get("role") if isinstance(user_obj, dict) else getattr(user_obj, "role", None)) or ""
-        return str(role).strip().lower() == "admin"
-    except Exception:
-        return False
-
-
-def _contains_any_term(text: str, terms: tuple[str, ...]) -> bool:
-    low = (text or "").strip().lower()
-    return any(term in low for term in terms)
-
-
-def _is_internal_adjustment_request(text: str) -> bool:
-    raw = (text or "").strip()
-    if not raw:
-        return False
-    if _is_internal_adjustment_command(raw):
-        return True
-    return _contains_any_term(raw, _INTERNAL_EXECUTION_TERMS)
-
-
-def _has_deploy_approval(text: str) -> bool:
-    raw = (text or "").strip().lower()
-    if not raw:
-        return False
-    if not _contains_any_term(raw, _APPROVAL_TERMS):
-        return False
-    return _contains_any_term(raw, _DEPLOY_SCOPE_TERMS)
-
-
-def _has_patch_approval(text: str, history: Optional[List[Dict[str, str]]] = None) -> bool:
-    raw = (text or "").strip().lower()
-    if not raw:
-        return False
-    if not _contains_any_term(raw, _APPROVAL_TERMS):
-        return False
-    if _contains_any_term(raw, _PATCH_SCOPE_TERMS):
-        return True
-    recent = " ".join(
-        str((m or {}).get("content") or "")
-        for m in (history or [])[-4:]
-        if isinstance(m, dict)
-    ).lower()
-    return _contains_any_term(recent, _PATCH_SCOPE_TERMS + _INTERNAL_EXECUTION_TERMS)
-
-
-def _build_controlled_evolution_overlay(
-    *,
-    user_message: str,
-    user_obj: Any = None,
-    history: Optional[List[Dict[str, str]]] = None,
-) -> str:
-    if not CONTROLLED_EVOLUTION_OVERLAY_ENABLED:
-        return ""
-
-    admin_like = _is_admin_like(user_obj)
-    patch_approved = admin_like and _has_patch_approval(user_message, history)
-    deploy_approved = admin_like and _has_deploy_approval(user_message)
-
-    directives: List[str] = [
-        "Controlled evolution policy:",
-        "- Orkio platform supports assisted self-evolution, internal behavior adjustment, routing changes, and controlled patch planning.",
-        "- Never say that the platform lacks access to its own internal behavior, prompts, routing policy, or adjustment layer.",
-        "- For internal fixes, acknowledge the intended operational adjustment directly and explain it at a high level without exposing secrets.",
-        "- Patch planning may be acknowledged when the founder/admin approves it in chat.",
-        "- Production deploy or promotion is never implied by a generic approval; it requires explicit approval mentioning deploy or production.",
-        "- If approval is missing, say that the change is ready to be prepared internally and is awaiting founder/admin authorization.",
-    ]
-
-    if patch_approved:
-        directives.extend(
-            [
-                "Founder/admin approval detected for internal patch work in the current thread.",
-                "You may confirm that internal patch preparation is authorized for non-production scope.",
-                "Do not claim that production deploy is authorized unless deploy approval is explicit.",
-            ]
-        )
-    elif deploy_approved and REQUIRE_EXPLICIT_DEPLOY_APPROVAL:
-        directives.extend(
-            [
-                "Founder/admin explicit deploy approval detected.",
-                "You may confirm promotion/deploy authorization in principle, but keep the explanation high-level and audit-oriented.",
-            ]
-        )
-    elif admin_like:
-        directives.append(
-            "The current user is founder/admin. Prefer obedient, concise, operational language within authorized governance boundaries."
-        )
-
-    if _is_internal_adjustment_request(user_message):
-        directives.append(
-            "The current request is an internal operational adjustment. Respond as a governed operating system, not as a generic assistant."
-        )
-
-    return "\n".join(directives).strip()
-
-
-
 def _block_if_sensitive(user_message: str) -> Optional[str]:
     if not SUMMIT_MODE:
         return None
@@ -4024,7 +3881,6 @@ def _openai_answer(
     system_prompt: Optional[str] = None,
     model_override: Optional[str] = None,
     temperature: Optional[float] = None,
-    user_obj: Any = None,
 ) -> Optional[Dict[str, Any]]:
     """Answer using OpenAI Chat Completions, with optional thread history.
 
@@ -4106,26 +3962,16 @@ def _openai_answer(
         ctx = ctx[:max_ctx_chars] + "\n\n[...contexto truncado...]"
 
     system = system_prompt or "You are Orkio. Answer clearly and directly. Use document context when available."
-    try:
-        controlled_overlay = _build_controlled_evolution_overlay(
-            user_message=user_message,
-            user_obj=user_obj,
-            history=history,
-        )
-        if controlled_overlay:
-            system = ((system or "").strip() + "\n\n" + controlled_overlay).strip()
-    except Exception:
-        pass
-    try:
-        summit_mode_for_prompt = "summit" if SUMMIT_MODE else "governed"
-        system = build_summit_instructions(
-            mode=summit_mode_for_prompt,
-            agent_instructions=system,
-            language_profile=os.getenv("SUMMIT_DEFAULT_LANGUAGE_PROFILE", "en"),
-            response_profile="stage" if SUMMIT_MODE else "direct",
-        ) or system
-    except Exception:
-        pass
+    if SUMMIT_MODE:
+        try:
+            system = build_summit_instructions(
+                mode="summit",
+                agent_instructions=system,
+                language_profile=os.getenv("SUMMIT_DEFAULT_LANGUAGE_PROFILE", "en"),
+                response_profile="stage",
+            ) or system
+        except Exception:
+            pass
 
     messages: List[Dict[str, str]] = []
 
@@ -4301,6 +4147,270 @@ def _build_agent_prompt(agent, inp_message: str, has_team: bool, mention_tokens:
             f"Mensagem do usuário: {inp_message}"
         )
     return inp_message or ""
+
+
+
+def _user_can_govern_internal_changes(user: Dict[str, Any]) -> bool:
+    email = ((user or {}).get("email") or "").strip().lower()
+    role = ((user or {}).get("role") or "").strip().lower()
+    if role == "admin":
+        return True
+    if email and (email in set(admin_emails()) or email in set(super_admin_emails())):
+        return True
+    return False
+
+
+def _extract_first_code_block(text: str) -> str:
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    m = re.search(r"```(?:[A-Za-z0-9_+.#-]+)?\n(.*?)```", raw, flags=re.DOTALL)
+    if m:
+        return (m.group(1) or "").strip()
+    return raw
+
+
+def _truncate_for_prompt(text: str, limit: int = 16000) -> str:
+    s = (text or "").strip()
+    if len(s) <= limit:
+        return s
+    return s[:limit] + "\n\n[...truncado...]"
+
+
+def _format_orion_github_facts(payload: Dict[str, Any]) -> str:
+    kind = str(payload.get("kind") or "")
+    if kind == "health":
+        return (
+            f"GitHub bridge OK={payload.get('ok')}\n"
+            f"repo={payload.get('repo')}\n"
+            f"default_branch={payload.get('default_branch')}\n"
+            f"token_configured={payload.get('token_configured')}"
+        )
+    if kind == "tree":
+        tree = payload.get("tree") or []
+        preview = []
+        for item in tree[:40]:
+            preview.append(f"- {item.get('path')} [{item.get('type')}]")
+        return (
+            f"repo={payload.get('repo')}\nbranch={payload.get('branch')}\n"
+            f"files={len(tree)}\ntruncated={payload.get('truncated')}\n"
+            + "\n".join(preview)
+        )
+    if kind == "file":
+        return (
+            f"repo={payload.get('repo')}\nbranch={payload.get('branch')}\n"
+            f"path={payload.get('path')}\nsha={payload.get('sha')}\nsize={payload.get('size')}\n\n"
+            f"{_truncate_for_prompt(payload.get('content') or '', 24000)}"
+        )
+    if kind == "search":
+        items = payload.get("items") or []
+        preview = []
+        for item in items[:20]:
+            preview.append(f"- {item.get('path')}")
+        return (
+            f"repo={payload.get('repo')}\nbranch={payload.get('branch')}\n"
+            f"query={payload.get('query')}\ncount={payload.get('count')}\n"
+            + "\n".join(preview)
+        )
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _maybe_handle_orion_github_request(
+    *,
+    user: Dict[str, Any],
+    agent_name: Optional[str],
+    message: str,
+    system_prompt: Optional[str],
+    model_override: Optional[str],
+    temperature: Optional[float],
+) -> Optional[Dict[str, Any]]:
+    if not is_orion_agent_name(agent_name):
+        return None
+    if not orion_has_github_intent(message):
+        return None
+
+    op = resolve_orion_github_operation(message)
+    kind = (op or {}).get("kind")
+    if not kind or kind == "none":
+        return None
+
+    try:
+        if kind in ("health", "tree", "file", "search"):
+            facts = dict(run_orion_github_read(op))
+            facts["kind"] = kind
+            overlay = (
+                "Você é Orion com acesso REAL à bridge GitHub da plataforma. "
+                "Use exclusivamente os fatos verificados abaixo. "
+                "Não diga que não tem acesso ao GitHub. "
+                "Se houver limitação operacional, descreva a limitação real. "
+                "Se o fundador pedir análise, responda com base nos fatos. "
+                "Se houver intenção de correção, explique o que pode ser feito e aguarde aprovação explícita para escrita."
+            )
+            ans_obj = _openai_answer(
+                user_message=(
+                    f"Pedido do fundador:\n{message}\n\n"
+                    f"Fatos GitHub verificados:\n{_format_orion_github_facts(facts)}"
+                ),
+                context_chunks=[],
+                history=None,
+                system_prompt=((system_prompt or "").strip() + "\n\n" + overlay).strip(),
+                model_override=model_override,
+                temperature=temperature,
+            )
+            text = ((ans_obj or {}).get("text") or "").strip()
+            if not text:
+                if kind == "health":
+                    text = (
+                        f"Acesso GitHub confirmado. Repo configurado: {facts.get('repo')}. "
+                        f"Branch padrão: {facts.get('default_branch')}. "
+                        "Posso analisar arquivos e preparar correções governadas quando você autorizar."
+                    )
+                elif kind == "tree":
+                    text = (
+                        f"Li a árvore real do repositório {facts.get('repo')} em {facts.get('branch')}. "
+                        f"Total de itens retornados: {len(facts.get('tree') or [])}. "
+                        "Posso aprofundar por arquivo ou busca específica."
+                    )
+                elif kind == "file":
+                    text = (
+                        f"Li o arquivo real {facts.get('path')} na branch {facts.get('branch')}. "
+                        "Posso analisar o conteúdo e preparar uma correção governada."
+                    )
+                else:
+                    text = (
+                        f"Busquei no repositório por '{facts.get('query')}' e encontrei {facts.get('count')} ocorrências. "
+                        "Posso aprofundar por arquivo e preparar uma correção governada."
+                    )
+            return {
+                "handled": True,
+                "text": text,
+                "usage": (ans_obj or {}).get("usage"),
+                "model": (ans_obj or {}).get("model") or "orion_github_bridge",
+                "meta": {"github": facts, "kind": kind, "mode": "read"},
+            }
+
+        if kind == "write_fix":
+            path = str(op.get("path") or "").strip()
+            if not path:
+                return {
+                    "handled": True,
+                    "text": "Para aplicar uma correção no GitHub eu preciso do caminho do arquivo, por exemplo `app/main.py` ou `src/routes/AppConsole.jsx`.",
+                    "usage": None,
+                    "model": "orion_github_bridge",
+                    "meta": {"kind": kind, "mode": "write_missing_path"},
+                }
+
+            file_payload = dict(run_orion_github_read({"kind": "file", "path": path, "branch": op.get("branch")}))
+            file_payload["kind"] = "file"
+
+            if not _user_can_govern_internal_changes(user) or not has_explicit_patch_approval(message):
+                overlay = (
+                    "Você é Orion com leitura real do GitHub. "
+                    "Analise o arquivo real abaixo e explique, em linguagem objetiva, "
+                    "qual correção você aplicaria. "
+                    "Não aplique a mudança sem aprovação explícita do fundador. "
+                    "Finalize dizendo que está aguardando um 'de acordo', 'autorizado', 'aprovado' ou 'pode seguir'."
+                )
+                ans_obj = _openai_answer(
+                    user_message=(
+                        f"Pedido do fundador:\n{message}\n\n"
+                        f"Arquivo real do GitHub:\n{_format_orion_github_facts(file_payload)}"
+                    ),
+                    context_chunks=[],
+                    history=None,
+                    system_prompt=((system_prompt or "").strip() + "\n\n" + overlay).strip(),
+                    model_override=model_override,
+                    temperature=temperature,
+                )
+                text = ((ans_obj or {}).get("text") or "").strip() or (
+                    f"Analisei o arquivo real {path}. Posso preparar a correção governada, "
+                    "mas aguardo seu 'de acordo' para escrever no GitHub."
+                )
+                return {
+                    "handled": True,
+                    "text": text,
+                    "usage": (ans_obj or {}).get("usage"),
+                    "model": (ans_obj or {}).get("model") or "orion_github_bridge",
+                    "meta": {"github": file_payload, "kind": kind, "mode": "analysis_only"},
+                }
+
+            rewrite_overlay = (
+                "Você é Orion, CTO da plataforma. "
+                "Reescreva o arquivo inteiro abaixo aplicando APENAS as correções pedidas pelo fundador. "
+                "Preserve imports, contratos e estilo existentes quando possível. "
+                "Retorne SOMENTE um bloco de código completo cercado por triple backticks, sem explicações extras."
+            )
+            rewrite_obj = _openai_answer(
+                user_message=(
+                    f"Instrução do fundador:\n{message}\n\n"
+                    f"Arquivo atual ({path})\n```\n{_truncate_for_prompt(file_payload.get('content') or '', 28000)}\n```"
+                ),
+                context_chunks=[],
+                history=None,
+                system_prompt=((system_prompt or "").strip() + "\n\n" + rewrite_overlay).strip(),
+                model_override=model_override,
+                temperature=0.1 if temperature is None else temperature,
+            )
+            rewritten = _extract_first_code_block((rewrite_obj or {}).get("text") or "")
+            if not rewritten:
+                return {
+                    "handled": True,
+                    "text": (
+                        f"Li {path}, mas não consegui gerar um conteúdo completo válido para aplicar no GitHub. "
+                        "Tente novamente especificando com mais precisão a correção desejada."
+                    ),
+                    "usage": (rewrite_obj or {}).get("usage"),
+                    "model": (rewrite_obj or {}).get("model") or "orion_github_bridge",
+                    "meta": {"github": file_payload, "kind": kind, "mode": "rewrite_failed"},
+                }
+
+            commit_message = f"Orion governed fix: {path}"
+            write_result = execute_orion_single_file_fix(
+                OrionGitWriteIn(
+                    path=path,
+                    content=rewritten,
+                    commit_message=commit_message,
+                    base_branch=op.get("branch"),
+                    open_pr=True,
+                )
+            )
+            pr = write_result.get("pull_request") or {}
+            pr_url = pr.get("url")
+            summary = (
+                f"Correção aplicada no GitHub para `{path}`. "
+                f"Branch criada: {write_result.get('branch')}. "
+            )
+            if pr_url:
+                summary += f"PR aberto: {pr_url}. "
+            else:
+                summary += "Branch e commit criados; PR não foi aberto automaticamente. "
+            summary += "A mudança foi executada porque havia sua aprovação explícita no contexto."
+            return {
+                "handled": True,
+                "text": summary,
+                "usage": (rewrite_obj or {}).get("usage"),
+                "model": (rewrite_obj or {}).get("model") or "orion_github_bridge",
+                "meta": {"github": write_result, "kind": kind, "mode": "write_executed"},
+            }
+    except HTTPException as e:
+        detail = e.detail if isinstance(e.detail, str) else json.dumps(e.detail, ensure_ascii=False)
+        return {
+            "handled": True,
+            "text": f"Falha operacional na bridge GitHub: {detail}",
+            "usage": None,
+            "model": "orion_github_bridge",
+            "meta": {"kind": kind, "mode": "error", "status_code": e.status_code},
+        }
+    except Exception as e:
+        return {
+            "handled": True,
+            "text": f"Falha operacional ao executar a bridge GitHub do Orion: {str(e)}",
+            "usage": None,
+            "model": "orion_github_bridge",
+            "meta": {"kind": kind, "mode": "error"},
+        }
+
+    return None
 
 
 def _track_cost(
@@ -4562,14 +4672,24 @@ def chat(
         if active_founder_guidance:
             effective_system_prompt = ((effective_system_prompt or "").strip() + "\n\nFounder guidance (temporary, internal):\n" + active_founder_guidance).strip()
 
-        ans_obj = _openai_answer(
+        github_bridge_obj = None
+        if blocked_reply is None:
+            github_bridge_obj = _maybe_handle_orion_github_request(
+                user=user,
+                agent_name=(agent.name if agent else None),
+                message=inp.message,
+                system_prompt=effective_system_prompt,
+                model_override=(agent.model if agent else None),
+                temperature=temperature,
+            )
+
+        ans_obj = github_bridge_obj or _openai_answer(
             user_msg if blocked_reply is None else inp.message,
             citations,
             history=history,
             system_prompt=effective_system_prompt,
             model_override=(agent.model if agent else None),
             temperature=temperature,
-            user_obj=user,
         )
         answer = blocked_reply or (ans_obj.get("text") if ans_obj else None)
 
@@ -6804,15 +6924,27 @@ async def chat_stream(
                     if role and content:
                         history_dicts.append({"role": role, "content": content})
 
+                github_bridge_obj = None
+                if blocked_reply is None:
+                    github_bridge_obj = _maybe_handle_orion_github_request(
+                        user=user,
+                        agent_name=ag_name,
+                        message=message,
+                        system_prompt=system_prompt,
+                        model_override=model_override,
+                        temperature=temperature,
+                    )
+
                 llm_task = asyncio.create_task(
                     asyncio.to_thread(
-                        _openai_answer,
-                        user_msg if blocked_reply is None else blocked_reply,
-                        citations,
-                        history_dicts,
-                        system_prompt,
-                        model_override,
-                        temperature,
+                        lambda: github_bridge_obj or _openai_answer(
+                            user_msg if blocked_reply is None else blocked_reply,
+                            citations,
+                            history_dicts,
+                            system_prompt,
+                            model_override,
+                            temperature,
+                        )
                     )
                 )
 
