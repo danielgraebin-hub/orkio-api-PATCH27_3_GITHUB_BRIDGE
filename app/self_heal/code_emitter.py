@@ -20,19 +20,19 @@ class CodeEmitterEngine:
 
     def __init__(self) -> None:
         self.generated_artifacts: Dict[str, Dict[str, Any]] = {}
-        self.auto_emit_enabled = os.getenv("AUTO_CODE_EMISSION_ENABLED", "true").strip().lower() in (
+        self.auto_emit_enabled = os.getenv("AUTO_CODE_EMISSION_ENABLED", "false").strip().lower() in (
             "1",
             "true",
             "yes",
             "on",
         )
-        self.auto_pr_backend_enabled = os.getenv("AUTO_PR_BACKEND_ENABLED", "true").strip().lower() in (
+        self.auto_pr_backend_enabled = os.getenv("AUTO_PR_BACKEND_ENABLED", "false").strip().lower() in (
             "1",
             "true",
             "yes",
             "on",
         )
-        self.auto_pr_frontend_enabled = os.getenv("AUTO_PR_FRONTEND_ENABLED", "true").strip().lower() in (
+        self.auto_pr_frontend_enabled = os.getenv("AUTO_PR_FRONTEND_ENABLED", "false").strip().lower() in (
             "1",
             "true",
             "yes",
