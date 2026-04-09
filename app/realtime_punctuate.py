@@ -15,6 +15,7 @@ except Exception:  # pragma: no cover
 
 from app.db import SessionLocal
 from app.models import RealtimeEvent
+from app.self_heal.realtime_guard import guard
 
 logger = logging.getLogger(__name__)
 
@@ -53,10 +54,20 @@ def _punctuate_with_openai(text: str) -> Optional[str]:
         return None
 
 
+def _event_session_key(ev: RealtimeEvent) -> str:
+    """Best-effort session key resolution across schema variations."""
+    for attr in ("session_id", "realtime_session_id", "stream_id", "conversation_id"):
+        value = getattr(ev, attr, None)
+        if value:
+            return str(value)
+    return ""
+
+
 def punctuate_realtime_events(org_slug: str, event_ids: Iterable[str]) -> None:
     """Best-effort async job.
     - Loads realtime_events by id
-    - For each event with content, stores transcript_punct (OpenAI or fallback = content)
+    - For each final event with content, stores transcript_punct (OpenAI or fallback = content)
+    - Protects against duplicate final commits from the same realtime session
     Never raises to caller.
     """
     if SessionLocal is None:
@@ -77,9 +88,22 @@ def punctuate_realtime_events(org_slug: str, event_ids: Iterable[str]) -> None:
 
         for ev in rows:
             try:
+                event_type = (getattr(ev, "event_type", None) or "").strip()
+
                 # Only punctuate finals; caller should filter, but keep safe here too
-                if not (ev.event_type or "").endswith(".final"):
+                if not event_type.endswith(".final"):
                     continue
+
+                session_id = _event_session_key(ev)
+                if session_id and not guard.should_commit(session_id):
+                    logger.warning(
+                        "REALTIME_DUPLICATION_GUARD_BLOCKED event_id=%s session_id=%s event_type=%s",
+                        getattr(ev, "id", None),
+                        session_id,
+                        event_type,
+                    )
+                    continue
+
                 raw_text = (
                     getattr(ev, "transcript_raw", None)
                     or getattr(ev, "content", None)
@@ -87,12 +111,21 @@ def punctuate_realtime_events(org_slug: str, event_ids: Iterable[str]) -> None:
                 ).strip()
                 if not raw_text:
                     continue
+
                 # Idempotent
                 if getattr(ev, "transcript_punct", None):
                     continue
 
                 punct = _punctuate_with_openai(raw_text)
                 ev.transcript_punct = punct or raw_text
+
+                logger.info(
+                    "REALTIME_FINAL_COMMIT_OK event_id=%s session_id=%s event_type=%s",
+                    getattr(ev, "id", None),
+                    session_id,
+                    event_type,
+                )
+
             except Exception:
                 # Never break the batch
                 logger.exception("punctuate_row_failed id=%s", getattr(ev, "id", None))
