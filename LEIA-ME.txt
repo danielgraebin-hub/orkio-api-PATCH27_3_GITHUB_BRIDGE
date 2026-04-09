@@ -72,3 +72,5 @@ v4 mantém o tronco auditado e avança nos P0/P1 centrais da war room:
 - routing_confidence calculado e exposto em runtime_hints.routing
 - execution_cursor/execution_lifecycle enriquecidos
 - finalize_execution_snapshot aplicado ao runtime antes da resposta final
+
+# rebuild trigger
