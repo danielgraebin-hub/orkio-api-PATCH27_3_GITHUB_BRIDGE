@@ -227,6 +227,8 @@ MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "20"))
 SUMMIT_MODE = os.getenv("SUMMIT_MODE", "false").strip().lower() in ("1", "true")
 SUMMIT_AGENT_ID = os.getenv("SUMMIT_AGENT_ID", "").strip()
 SUMMIT_EXPIRES_AT = int(os.getenv("SUMMIT_EXPIRES_AT", "1775087999"))  # 2026-04-01 23:59:59 UTC
+CONTROLLED_EVOLUTION_OVERLAY_ENABLED = os.getenv("CONTROLLED_EVOLUTION_OVERLAY_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+REQUIRE_EXPLICIT_DEPLOY_APPROVAL = os.getenv("REQUIRE_EXPLICIT_DEPLOY_APPROVAL", "true").strip().lower() in ("1", "true", "yes", "on")
 # Summit access window enforcement (standard users only)
 def _summit_access_expired(payload_or_user: Any) -> bool:
     """Return True if Summit access window is expired for a summit_standard (non-admin) user."""
@@ -2817,15 +2819,23 @@ async def _startup():
             except Exception:
                 pass
         else:
-            try:
-                logger.warning("EVOLUTION_LOOP_BOOT_REQUESTED")
-            except Exception:
-                pass
+            evolution_enabled = os.getenv("ENABLE_EVOLUTION_LOOP", "false").strip().lower() in ("1", "true", "yes", "on")
+            force_enabled = os.getenv("FORCE_ENABLE_EVOLUTION_LOOP", "false").strip().lower() in ("1", "true", "yes", "on")
+            if not (evolution_enabled or force_enabled):
+                try:
+                    logger.warning("EVOLUTION_LOOP_BOOT_SKIPPED approval_gate=env_disabled")
+                except Exception:
+                    pass
+            else:
+                try:
+                    logger.warning("EVOLUTION_LOOP_BOOT_REQUESTED")
+                except Exception:
+                    pass
 
-            await start_evolution_loop(
-                db_factory=lambda: SessionLocal(),
-                logger=logger,
-            )
+                await start_evolution_loop(
+                    db_factory=lambda: SessionLocal(),
+                    logger=logger,
+                )
     except Exception as exc:
         try:
             logger.exception("EVOLUTION_LOOP_BOOT_FAIL: %s", exc)
@@ -3726,6 +3736,149 @@ def _is_internal_adjustment_command(user_message: str) -> bool:
     return bool(has_action and has_target and not asks_for_raw_assets)
 
 
+_APPROVAL_TERMS = (
+    "de acordo",
+    "autorizado",
+    "autorizada",
+    "aprovado",
+    "aprovada",
+    "pode seguir",
+    "ok executar",
+    "ok, executar",
+    "liberado",
+)
+_PATCH_SCOPE_TERMS = (
+    "patch",
+    "ajuste",
+    "ajustar",
+    "correção",
+    "corrigir",
+    "interno",
+    "staging",
+    "sem deploy",
+    "sem promover",
+)
+_DEPLOY_SCOPE_TERMS = (
+    "deploy",
+    "produção",
+    "producao",
+    "promover",
+    "production",
+)
+_INTERNAL_EXECUTION_TERMS = (
+    "ajuste interno",
+    "correção interna",
+    "internal adjustment",
+    "behavior fix",
+    "routing adjustment",
+    "response-policy change",
+    "self-heal",
+    "auto evolução",
+    "autoevolução",
+    "evolução assistida",
+    "evolucao assistida",
+)
+
+
+def _is_admin_like(user_obj: Any) -> bool:
+    try:
+        role = (user_obj.get("role") if isinstance(user_obj, dict) else getattr(user_obj, "role", None)) or ""
+        return str(role).strip().lower() == "admin"
+    except Exception:
+        return False
+
+
+def _contains_any_term(text: str, terms: tuple[str, ...]) -> bool:
+    low = (text or "").strip().lower()
+    return any(term in low for term in terms)
+
+
+def _is_internal_adjustment_request(text: str) -> bool:
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    if _is_internal_adjustment_command(raw):
+        return True
+    return _contains_any_term(raw, _INTERNAL_EXECUTION_TERMS)
+
+
+def _has_deploy_approval(text: str) -> bool:
+    raw = (text or "").strip().lower()
+    if not raw:
+        return False
+    if not _contains_any_term(raw, _APPROVAL_TERMS):
+        return False
+    return _contains_any_term(raw, _DEPLOY_SCOPE_TERMS)
+
+
+def _has_patch_approval(text: str, history: Optional[List[Dict[str, str]]] = None) -> bool:
+    raw = (text or "").strip().lower()
+    if not raw:
+        return False
+    if not _contains_any_term(raw, _APPROVAL_TERMS):
+        return False
+    if _contains_any_term(raw, _PATCH_SCOPE_TERMS):
+        return True
+    recent = " ".join(
+        str((m or {}).get("content") or "")
+        for m in (history or [])[-4:]
+        if isinstance(m, dict)
+    ).lower()
+    return _contains_any_term(recent, _PATCH_SCOPE_TERMS + _INTERNAL_EXECUTION_TERMS)
+
+
+def _build_controlled_evolution_overlay(
+    *,
+    user_message: str,
+    user_obj: Any = None,
+    history: Optional[List[Dict[str, str]]] = None,
+) -> str:
+    if not CONTROLLED_EVOLUTION_OVERLAY_ENABLED:
+        return ""
+
+    admin_like = _is_admin_like(user_obj)
+    patch_approved = admin_like and _has_patch_approval(user_message, history)
+    deploy_approved = admin_like and _has_deploy_approval(user_message)
+
+    directives: List[str] = [
+        "Controlled evolution policy:",
+        "- Orkio platform supports assisted self-evolution, internal behavior adjustment, routing changes, and controlled patch planning.",
+        "- Never say that the platform lacks access to its own internal behavior, prompts, routing policy, or adjustment layer.",
+        "- For internal fixes, acknowledge the intended operational adjustment directly and explain it at a high level without exposing secrets.",
+        "- Patch planning may be acknowledged when the founder/admin approves it in chat.",
+        "- Production deploy or promotion is never implied by a generic approval; it requires explicit approval mentioning deploy or production.",
+        "- If approval is missing, say that the change is ready to be prepared internally and is awaiting founder/admin authorization.",
+    ]
+
+    if patch_approved:
+        directives.extend(
+            [
+                "Founder/admin approval detected for internal patch work in the current thread.",
+                "You may confirm that internal patch preparation is authorized for non-production scope.",
+                "Do not claim that production deploy is authorized unless deploy approval is explicit.",
+            ]
+        )
+    elif deploy_approved and REQUIRE_EXPLICIT_DEPLOY_APPROVAL:
+        directives.extend(
+            [
+                "Founder/admin explicit deploy approval detected.",
+                "You may confirm promotion/deploy authorization in principle, but keep the explanation high-level and audit-oriented.",
+            ]
+        )
+    elif admin_like:
+        directives.append(
+            "The current user is founder/admin. Prefer obedient, concise, operational language within authorized governance boundaries."
+        )
+
+    if _is_internal_adjustment_request(user_message):
+        directives.append(
+            "The current request is an internal operational adjustment. Respond as a governed operating system, not as a generic assistant."
+        )
+
+    return "\n".join(directives).strip()
+
+
+
 def _block_if_sensitive(user_message: str) -> Optional[str]:
     if not SUMMIT_MODE:
         return None
@@ -3871,6 +4024,7 @@ def _openai_answer(
     system_prompt: Optional[str] = None,
     model_override: Optional[str] = None,
     temperature: Optional[float] = None,
+    user_obj: Any = None,
 ) -> Optional[Dict[str, Any]]:
     """Answer using OpenAI Chat Completions, with optional thread history.
 
@@ -3952,16 +4106,26 @@ def _openai_answer(
         ctx = ctx[:max_ctx_chars] + "\n\n[...contexto truncado...]"
 
     system = system_prompt or "You are Orkio. Answer clearly and directly. Use document context when available."
-    if SUMMIT_MODE:
-        try:
-            system = build_summit_instructions(
-                mode="summit",
-                agent_instructions=system,
-                language_profile=os.getenv("SUMMIT_DEFAULT_LANGUAGE_PROFILE", "en"),
-                response_profile="stage",
-            ) or system
-        except Exception:
-            pass
+    try:
+        controlled_overlay = _build_controlled_evolution_overlay(
+            user_message=user_message,
+            user_obj=user_obj,
+            history=history,
+        )
+        if controlled_overlay:
+            system = ((system or "").strip() + "\n\n" + controlled_overlay).strip()
+    except Exception:
+        pass
+    try:
+        summit_mode_for_prompt = "summit" if SUMMIT_MODE else "governed"
+        system = build_summit_instructions(
+            mode=summit_mode_for_prompt,
+            agent_instructions=system,
+            language_profile=os.getenv("SUMMIT_DEFAULT_LANGUAGE_PROFILE", "en"),
+            response_profile="stage" if SUMMIT_MODE else "direct",
+        ) or system
+    except Exception:
+        pass
 
     messages: List[Dict[str, str]] = []
 
@@ -4405,6 +4569,7 @@ def chat(
             system_prompt=effective_system_prompt,
             model_override=(agent.model if agent else None),
             temperature=temperature,
+            user_obj=user,
         )
         answer = blocked_reply or (ans_obj.get("text") if ans_obj else None)
 
