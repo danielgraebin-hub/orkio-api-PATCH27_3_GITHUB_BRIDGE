@@ -23,226 +23,90 @@ from .git_internal import (
 
 router = APIRouter(prefix="/api/internal/orion", tags=["orion-internal"])
 
-_PATCH_APPROVAL_MARKERS = (
-    "de acordo",
-    "aprovado",
-    "autorizado",
-    "pode seguir",
-    "ok, executar",
-    "ok executar",
-    "liberado",
-)
 
-_DEPLOY_APPROVAL_MARKERS = (
-    "autorizo deploy",
-    "deploy autorizado",
-    "pode promover para produção",
-    "pode promover para producao",
-    "autorizo produção",
-    "autorizo producao",
-)
-
-_GITHUB_KEYWORDS = (
-    "github",
-    "repo",
-    "repositório",
-    "repositorio",
-    "branch",
-    "ramo",
-    "commit",
-    "pull request",
-    "pr ",
-    "arquivo",
-    "file ",
-    "código",
-    "codigo",
-    "crie",
-    "criar",
-    "novo arquivo",
-)
-
-
-class OrionGitWriteIn(BaseModel):
-    path: str = Field(min_length=1)
-    content: str = Field(min_length=1)
-    commit_message: str = Field(min_length=3, max_length=300)
-    branch: Optional[str] = Field(default=None, max_length=120)
-    base_branch: Optional[str] = Field(default=None, max_length=120)
-    open_pr: bool = True
-
+# =========================================================
+# ENV helpers
+# =========================================================
 
 def _env(name: str, default: str = "") -> str:
     return (os.getenv(name, default) or "").strip().strip('"').strip("'")
 
 
-def is_orion_agent_name(name: Optional[str]) -> bool:
-    s = (name or "").strip().lower()
-    return s.startswith("orion")
+# =========================================================
+# MODELS
+# =========================================================
+
+class OrionGitWriteIn(BaseModel):
+    path: str
+    content: str
+    commit_message: str
+    branch: Optional[str] = None
+    base_branch: Optional[str] = None
+    open_pr: bool = True
 
 
-def has_github_intent(message: str) -> bool:
-    s = (message or "").lower()
-    return any(k in s for k in _GITHUB_KEYWORDS)
+class OrionBranchCreateIn(BaseModel):
+    branch_name: str
+    source_branch: Optional[str] = None
 
 
-def has_explicit_patch_approval(message: str) -> bool:
-    s = (message or "").lower()
-    return any(k in s for k in _PATCH_APPROVAL_MARKERS)
-
-
-def has_explicit_deploy_approval(message: str) -> bool:
-    s = (message or "").lower()
-    return any(k in s for k in _DEPLOY_APPROVAL_MARKERS) or ("deploy" in s and "produção" in s) or ("deploy" in s and "producao" in s)
-
-
-def _extract_branch(message: str) -> Optional[str]:
-    s = message or ""
-    patterns = [
-        r"(?:branch|ramo)\s*[:=]\s*([A-Za-z0-9_./\-]{2,120})",
-        r"(?:na|no)\s+branch\s+([A-Za-z0-9_./\-]{2,120})",
-    ]
-    for pat in patterns:
-        m = re.search(pat, s, flags=re.IGNORECASE)
-        if m:
-            return m.group(1).strip()
-    return None
-
-
-def _extract_path(message: str) -> Optional[str]:
-    s = message or ""
-    fenced = re.findall(r"`([^`]+)`", s)
-    for item in fenced:
-        item = item.strip()
-        if "/" in item and "." in item and " " not in item:
-            return item
-    patterns = [
-        r"(?:arquivo|file|path|caminho)\s*[:=]\s*([A-Za-z0-9_./\-]+\.[A-Za-z0-9_]+)",
-        r"([A-Za-z0-9_./\-]+\.[A-Za-z0-9_]+)",
-    ]
-    for pat in patterns:
-        m = re.search(pat, s, flags=re.IGNORECASE)
-        if m:
-            candidate = m.group(1).strip()
-            if "/" in candidate or candidate.endswith((".py", ".ts", ".tsx", ".js", ".jsx", ".json", ".md", ".yml", ".yaml", ".sql", ".css", ".html")):
-                return candidate
-    return None
-
-
-def _extract_search_query(message: str) -> Optional[str]:
-    s = (message or "").strip()
-    quoted = re.findall(r'"([^"]+)"', s)
-    if quoted:
-        return quoted[0].strip()
-    quoted = re.findall(r"'([^']+)'", s)
-    if quoted:
-        return quoted[0].strip()
-    m = re.search(r"(?:buscar|busque|procure|pesquise|search)\s+(.+)", s, flags=re.IGNORECASE)
-    if m:
-        return m.group(1).strip()[:180]
-    return None
-
-
-
-
-def _extract_content_literal(message: str) -> Optional[str]:
-    s = message or ""
-    code_blocks = re.findall(r"```(?:[a-zA-Z0-9_+-]+)?\n([\s\S]*?)```", s)
-    if code_blocks:
-        return code_blocks[0].strip()
-
-    quoted = re.search(r'conte[uú]do\s*[:=]\s*"([\s\S]+)"', s, flags=re.IGNORECASE)
-    if quoted:
-        return quoted.group(1).strip()
-    quoted = re.search(r"conte[uú]do\s*[:=]\s*'([\s\S]+)'", s, flags=re.IGNORECASE)
-    if quoted:
-        return quoted.group(1).strip()
-
-    m = re.search(r'com\s+conte[uú]do\s+"([\s\S]+)"', s, flags=re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-    m = re.search(r"com\s+conte[uú]do\s+'([\s\S]+)'", s, flags=re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-
-    m = re.search(r'com\s+conte[uú]do\s*[:=]?\s*([\s\S]+)$', s, flags=re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-    return None
-
-
-def _extract_branch_create_name(message: str) -> Optional[str]:
-    s = message or ""
-    patterns = [
-        r"(?:crie|criar|abra|gerar)\s+(?:uma\s+)?branch\s+(?:chamada\s+)?([A-Za-z0-9_./\-]{2,120})",
-        r"(?:crie|criar|abra|gerar)\s+(?:um\s+)?ramo\s+(?:chamado\s+)?([A-Za-z0-9_./\-]{2,120})",
-    ]
-    for pat in patterns:
-        m = re.search(pat, s, flags=re.IGNORECASE)
-        if m:
-            return m.group(1).strip()
-    return None
-
-
-def _looks_like_create_branch(message: str) -> bool:
-    low = (message or "").lower()
-    return ("branch" in low or "ramo" in low) and any(k in low for k in ("crie", "criar", "abra", "gerar"))
-
-
-def _looks_like_create_file(message: str) -> bool:
-    low = (message or "").lower()
-    return any(k in low for k in ("crie", "criar", "novo arquivo", "adicione arquivo")) and any(k in low for k in ("arquivo", "file"))
-
-
-def resolve_orion_github_operation(message: str) -> Dict[str, Any]:
-    s = (message or "").strip()
-    low = s.lower()
-    if not has_github_intent(low):
-        return {"kind": "none"}
-
-    branch = _extract_branch(s)
-    path = _extract_path(s)
-
-    if any(k in low for k in ("acesso", "access", "health", "status", "conect")):
-        return {"kind": "health", "branch": branch}
-    if any(k in low for k in ("árvore", "arvore", "tree", "listar repo", "listar reposit", "liste o repo", "listar arquivos")):
-        return {"kind": "tree", "branch": branch}
-    if any(k in low for k in ("corrija", "corrigir", "ajuste", "ajustar", "aplique", "aplicar", "fix", "patch")) and path:
-        return {"kind": "write_fix", "branch": branch, "path": path}
-    if path and any(k in low for k in ("arquivo", "file", "ler", "abra", "mostrar", "mostre", "analise")):
-        return {"kind": "file", "branch": branch, "path": path}
-
-    search_query = _extract_search_query(s)
-    if search_query:
-        return {"kind": "search", "branch": branch, "query": search_query}
-
-    if path:
-        return {"kind": "file", "branch": branch, "path": path}
-    return {"kind": "tree", "branch": branch}
-
-
-def run_orion_github_read(op: Dict[str, Any]) -> Dict[str, Any]:
-    kind = (op or {}).get("kind")
-    if kind == "health":
-        return git_health()
-    if kind == "tree":
-        return git_tree(branch=op.get("branch"))
-    if kind == "file":
-        return git_file(path=str(op.get("path") or ""), branch=op.get("branch"))
-    if kind == "search":
-        return git_search(query=str(op.get("query") or ""), branch=op.get("branch"))
-    raise HTTPException(status_code=400, detail=f"Unsupported Orion GitHub read op: {kind}")
-
+# =========================================================
+# HELPERS
+# =========================================================
 
 def create_orion_branch_name(path: str) -> str:
-    cleaned = re.sub(r"[^a-zA-Z0-9/_\-.]+", "-", (path or "change").strip().lower()).strip("-")
+    cleaned = re.sub(r"[^a-zA-Z0-9/_\-.]+", "-", path.lower())
     cleaned = cleaned.replace("/", "-").replace("_", "-").replace(".", "-")
-    cleaned = re.sub(r"-{2,}", "-", cleaned).strip("-")[:48] or "change"
+    cleaned = re.sub(r"-{2,}", "-", cleaned).strip("-")[:48]
+
     return f"orion-fix/{cleaned}-{int(time.time())}"
 
 
-def execute_orion_single_file_fix(payload: OrionGitWriteIn) -> Dict[str, Any]:
-    branch_name = (payload.branch or "").strip() or create_orion_branch_name(payload.path)
-    base_branch = (payload.base_branch or _env("GITHUB_BRANCH", "main") or "main").strip()
+# =========================================================
+# EXECUTION LAYER
+# =========================================================
+
+def execute_orion_branch_create(
+    *,
+    branch_name: str,
+    source_branch: Optional[str] = None,
+):
+
+    if not branch_name.strip():
+        raise HTTPException(400, "branch_name required")
+
+    data = git_create_branch(
+        BranchCreateIn(
+            branch_name=branch_name.strip(),
+            source_branch=(
+                source_branch
+                or _env("GITHUB_BRANCH", "main")
+            ),
+        )
+    )
+
+    return {
+        "ok": True,
+        "repo": _env("GITHUB_REPO"),
+        "branch": data["new_branch"],
+        "ref": data["ref"],
+        "sha": data["sha"],
+    }
+
+
+def execute_orion_single_file_fix(
+    payload: OrionGitWriteIn
+):
+
+    branch_name = (
+        payload.branch
+        or create_orion_branch_name(payload.path)
+    )
+
+    base_branch = (
+        payload.base_branch
+        or _env("GITHUB_BRANCH", "main")
+    )
 
     git_create_branch(
         BranchCreateIn(
@@ -250,6 +114,7 @@ def execute_orion_single_file_fix(payload: OrionGitWriteIn) -> Dict[str, Any]:
             source_branch=base_branch,
         )
     )
+
     commit_result = git_commit_file(
         CommitFileIn(
             path=payload.path,
@@ -259,63 +124,121 @@ def execute_orion_single_file_fix(payload: OrionGitWriteIn) -> Dict[str, Any]:
         )
     )
 
-    pr_result: Dict[str, Any] = {"ok": False, "created": False}
+    pr_result = {"created": False}
+
     if payload.open_pr:
+
         try:
+
             pr_result = git_open_pr(
                 PullRequestIn(
-                    title=payload.commit_message[:200],
-                    body=f"Governed Orion fix for `{payload.path}`.",
+                    title=payload.commit_message,
+                    body=f"Governed Orion patch for `{payload.path}`",
                     head=branch_name,
                     base=base_branch,
                 )
             )
+
             pr_result["created"] = True
+
         except Exception as e:
-            pr_result = {"ok": False, "created": False, "error": str(e)}
+
+            pr_result = {
+                "created": False,
+                "error": str(e),
+            }
 
     return {
+
         "ok": True,
         "repo": _env("GITHUB_REPO"),
-        "base_branch": base_branch,
+
         "branch": branch_name,
+        "base_branch": base_branch,
+
         "path": payload.path,
+
         "commit": commit_result,
         "pull_request": pr_result,
     }
 
 
-
-
-def execute_orion_branch_create(*, branch_name: str, source_branch: Optional[str] = None) -> Dict[str, Any]:
-    if not (branch_name or "").strip():
-        raise HTTPException(status_code=400, detail="branch_name required")
-    data = git_create_branch(
-        BranchCreateIn(
-            branch_name=branch_name.strip(),
-            source_branch=(source_branch or _env("GITHUB_BRANCH", "main") or "main").strip(),
-        )
-    )
-    return {
-        "ok": True,
-        "repo": _env("GITHUB_REPO"),
-        "source_branch": data.get("source_branch"),
-        "branch": data.get("new_branch"),
-        "ref": data.get("ref"),
-        "sha": data.get("sha"),
-    }
-
+# =========================================================
+# ROUTES
+# =========================================================
 
 @router.get("/health")
 def orion_health():
+
     return {
+
         "ok": True,
+
         "service": "orion_internal",
-        "github_bridge_ready": bool(_env("GITHUB_TOKEN")) and bool(_env("GITHUB_REPO")),
-        "default_branch": _env("GITHUB_BRANCH", "main"),
+
+        "github_bridge_ready":
+            bool(_env("GITHUB_TOKEN"))
+            and bool(_env("GITHUB_REPO")),
+
+        "default_branch":
+            _env("GITHUB_BRANCH", "main"),
     }
 
 
+# =========================================================
+# CREATE BRANCH (RUNTIME CHAT SUPPORT)
+# =========================================================
+
+@router.post("/github/branch")
+def orion_create_branch(payload: OrionBranchCreateIn):
+
+    return execute_orion_branch_create(
+
+        branch_name=payload.branch_name,
+
+        source_branch=payload.source_branch,
+    )
+
+
+# =========================================================
+# WRITE FILE (RUNTIME CHAT SUPPORT)
+# =========================================================
+
 @router.post("/github/write")
-def orion_github_write(payload: OrionGitWriteIn):
+def orion_write_file(payload: OrionGitWriteIn):
+
     return execute_orion_single_file_fix(payload)
+
+
+# =========================================================
+# READ OPERATIONS
+# =========================================================
+
+@router.get("/github/tree")
+def orion_repo_tree(branch: Optional[str] = None):
+
+    return git_tree(branch=branch)
+
+
+@router.get("/github/file")
+def orion_repo_file(
+    path: str,
+    branch: Optional[str] = None,
+):
+
+    return git_file(path=path, branch=branch)
+
+
+@router.get("/github/search")
+def orion_repo_search(
+    query: str,
+    branch: Optional[str] = None,
+):
+
+    return git_search(query=query, branch=branch)
+
+
+@router.get("/github/health")
+def orion_repo_health():
+
+    return git_health()
