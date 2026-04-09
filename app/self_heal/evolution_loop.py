@@ -5,6 +5,7 @@ import os
 
 from app.self_heal.frontend_guard import guard as frontend_guard
 from app.self_heal.capability_planner import planner
+from app.self_heal.scaffold_engine import scaffold_engine
 import app.self_heal.capabilities_bootstrap  # noqa: F401
 
 
@@ -43,6 +44,11 @@ class EvolutionLoop:
 
                 try:
                     planner.build_execution_plan("self_knowledge_app")
+                except Exception:
+                    pass
+
+                try:
+                    scaffold_engine.generate_blueprint("self_knowledge_app")
                 except Exception:
                     pass
 
