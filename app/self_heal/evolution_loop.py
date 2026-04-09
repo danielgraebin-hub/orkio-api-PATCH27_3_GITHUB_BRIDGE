@@ -34,7 +34,6 @@ class EvolutionLoop:
                 self.logger.warning("SELF_HEAL_POLICY_READY")
                 self.logger.warning("SELF_HEAL_VALIDATOR_READY")
 
-                # Frontend drift watcher
                 try:
                     frontend_guard.analyze_contract_mismatch(
                         endpoint="realtime_stream",
@@ -44,19 +43,16 @@ class EvolutionLoop:
                 except Exception:
                     pass
 
-                # Capability planner
                 try:
                     planner.build_execution_plan("self_knowledge_app")
                 except Exception:
                     pass
 
-                # Scaffold engine
                 try:
                     scaffold_engine.generate_blueprint("self_knowledge_app")
                 except Exception:
                     pass
 
-                # Code emitter engine
                 try:
                     code_emitter.emit_code_plan("self_knowledge_app")
                 except Exception:
