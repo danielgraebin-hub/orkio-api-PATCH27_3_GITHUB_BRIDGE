@@ -2755,6 +2755,7 @@ async def _startup():
                     logger.warning("CREATE_ALL finished successfully")
                 except Exception:
                     pass
+
             _run_with_timeout(_do_create_all, "CREATE_ALL", timeout_sec=30)
         else:
             try:
@@ -2802,7 +2803,9 @@ async def _startup():
     # ADMIN_API_KEY is optional. If not set, admin access is granted only via admin-role JWT.
     # (ADMIN_EMAILS controls who becomes admin on register/login.)
 
-    # Self-healing evolution loop (best-effort, never breaks startup)
+    # =========================================
+    # ORKIO SELF-HEAL EVOLUTION LOOP BOOT
+    # =========================================
     try:
         if start_evolution_loop is None:
             try:
@@ -2811,18 +2814,19 @@ async def _startup():
                 pass
         else:
             try:
-                logger.info("EVOLUTION_LOOP_BOOT_REQUESTED")
+                logger.warning("EVOLUTION_LOOP_BOOT_REQUESTED")
             except Exception:
                 pass
-            await start_evolution_loop(db_factory=SessionLocal, logger=logger)
+
+            await start_evolution_loop(
+                db_factory=SessionLocal,
+                logger=logger,
+            )
     except Exception as exc:
         try:
             logger.exception("EVOLUTION_LOOP_BOOT_FAIL: %s", exc)
         except Exception:
             pass
-
-    return None
-
 
 @app.get("/")
 def root():
