@@ -4416,6 +4416,10 @@ def _get_runtime_capability_registry() -> Dict[str, Any]:
         available.extend([
             "github_create_file",
             "github_create_branch",
+            "github_update_file",
+            "github_list_branches",
+            "github_list_files",
+            "github_create_pull_request",
         ])
     return {
         "available": available,
@@ -4577,6 +4581,75 @@ def _extract_github_create_branch_request(user_text: str) -> Optional[Dict[str, 
     return {"branch": branch}
 
 
+def _extract_github_list_branches_request(user_text: str) -> bool:
+    txt = (user_text or "").strip().lower()
+    return bool(txt) and "github" in txt and ("liste as branches" in txt or "listar as branches" in txt or "list branches" in txt)
+
+def _extract_github_list_files_request(user_text: str) -> Optional[Dict[str, str]]:
+    txt = (user_text or "").strip()
+    low = txt.lower()
+    if "github" not in low and "branch" not in low:
+        return None
+    if not any(k in low for k in ["liste arquivos", "listar arquivos", "list files"]):
+        return None
+    branch = ""
+    m = re.search(r"(?:branch|ramo|na branch)[: ]+([A-Za-z0-9._/\-]{1,120})", txt, flags=re.IGNORECASE)
+    if m:
+        branch = (m.group(1) or "").strip()
+    if not branch:
+        branch = _clean_env(os.getenv("GITHUB_BRANCH", "main"), default="main") or "main"
+    return {"branch": branch}
+
+def _extract_github_update_file_request(user_text: str) -> Optional[Dict[str, str]]:
+    txt = (user_text or "").strip()
+    low = txt.lower()
+    if "github" not in low:
+        return None
+    if not any(k in low for k in ["atualize o arquivo", "edite o arquivo", "update file", "update the file"]):
+        return None
+    patterns = [
+        r"(?:atualize o arquivo|edite o arquivo)[: ]+([A-Za-z0-9._/\-]{1,160})",
+        r"(?:update file|update the file)[: ]+([A-Za-z0-9._/\-]{1,160})",
+    ]
+    path = ""
+    for pat in patterns:
+        m = re.search(pat, txt, flags=re.IGNORECASE)
+        if m:
+            path = (m.group(1) or "").strip()
+            break
+    if not path:
+        return None
+    if path.startswith("/") or ".." in path or "\\" in path:
+        return {"invalid": "unsafe_path"}
+    content = ""
+    m_replace = re.search(r"(?:conte[uú]do|content|adicionando|append|com)[: ]+(.+)$", txt, flags=re.IGNORECASE | re.DOTALL)
+    if m_replace:
+        content = (m_replace.group(1) or "").strip()
+    if not content:
+        return {"invalid": "missing_content"}
+    return {"path": path, "content": content}
+
+def _extract_github_create_pr_request(user_text: str) -> Optional[Dict[str, str]]:
+    txt = (user_text or "").strip()
+    low = txt.lower()
+    if "pull request" not in low and "pr " not in f"{low} ":
+        return None
+    patterns = [
+        r"pull request da branch ([A-Za-z0-9._/\-]{1,120}) para ([A-Za-z0-9._/\-]{1,120}) com t[íi]tulo[: ]+(.+)$",
+        r"create a pull request from ([A-Za-z0-9._/\-]{1,120}) to ([A-Za-z0-9._/\-]{1,120}) with title[: ]+(.+)$",
+    ]
+    for pat in patterns:
+        m = re.search(pat, txt, flags=re.IGNORECASE | re.DOTALL)
+        if m:
+            head = (m.group(1) or "").strip()
+            base = (m.group(2) or "").strip()
+            title = (m.group(3) or "").strip()
+            if not head or not base or not title:
+                return None
+            return {"head": head, "base": base, "title": title}
+    return None
+
+
 
 def _build_execution_result_payload(result: Dict[str, Any]) -> str:
     if not result:
@@ -4601,8 +4674,25 @@ def _build_execution_result_payload(result: Dict[str, Any]) -> str:
         parts.append(f"path: {path}")
     if base_branch:
         parts.append(f"base_branch: {base_branch}")
+    pr_num = int(result.get("pull_request_number") or 0)
+    pr_url = (result.get("pull_request_url") or "").strip()
+    branches = result.get("branches") if isinstance(result.get("branches"), list) else None
+    files = result.get("files") if isinstance(result.get("files"), list) else None
+    title = (result.get("title") or "").strip()
     if commit_sha:
         parts.append(f"commit: {commit_sha[:12]}")
+    if pr_num:
+        parts.append(f"pull_request: #{pr_num}")
+    if title:
+        parts.append(f"title: {title}")
+    if pr_url:
+        parts.append(f"url: {pr_url}")
+    if branches is not None:
+        parts.append("branches:")
+        parts.extend(f"- {b}" for b in branches[:50])
+    if files is not None:
+        parts.append("files:")
+        parts.extend(f"- {f}" for f in files[:100])
     return "\n".join(parts)
 
 
@@ -4824,7 +4914,93 @@ def _github_create_branch_capability(*, branch: str, trace_id: Optional[str] = N
         "message": "Branch criada com confirmação operacional verificável.",
     }
 
+
+def _github_list_branches_capability(*, trace_id: Optional[str] = None) -> Dict[str, Any]:
+    repo = _clean_env(os.getenv("GITHUB_REPO", ""))
+    token = _clean_env(os.getenv("GITHUB_TOKEN", ""))
+    if not token or not repo:
+        return {"handled": True, "success": False, "provider": "github", "message": "GitHub capability não está habilitada no ambiente."}
+    url = f"https://api.github.com/repos/{repo}/branches?per_page=100"
+    status, body = _github_api_json("GET", url, None)
+    if status != 200 or not isinstance(body, list):
+        return {"handled": True, "success": False, "provider": "github", "repo": repo, "message": "Falha ao listar branches no GitHub."}
+    branches = [str((item or {}).get("name") or "").strip() for item in body if isinstance(item, dict)]
+    branches = [b for b in branches if b]
+    return {"handled": True, "success": True, "provider": "github", "repo": repo, "branches": branches, "message": "Branches listadas com confirmação operacional."}
+
+def _github_list_files_capability(*, branch: str, trace_id: Optional[str] = None) -> Dict[str, Any]:
+    repo = _clean_env(os.getenv("GITHUB_REPO", ""))
+    token = _clean_env(os.getenv("GITHUB_TOKEN", ""))
+    if not token or not repo:
+        return {"handled": True, "success": False, "provider": "github", "message": "GitHub capability não está habilitada no ambiente."}
+    url = f"https://api.github.com/repos/{repo}/contents?ref={branch}"
+    status, body = _github_api_json("GET", url, None)
+    if status != 200 or not isinstance(body, list):
+        return {"handled": True, "success": False, "provider": "github", "repo": repo, "branch": branch, "message": f"Falha ao listar arquivos da branch '{branch}'."}
+    files = [str((item or {}).get("name") or "").strip() for item in body if isinstance(item, dict)]
+    files = [f for f in files if f]
+    return {"handled": True, "success": True, "provider": "github", "repo": repo, "branch": branch, "files": files, "message": "Arquivos listados com confirmação operacional."}
+
+def _github_update_file_capability(*, path: str, content: str, trace_id: Optional[str] = None) -> Dict[str, Any]:
+    repo = _clean_env(os.getenv("GITHUB_REPO", ""))
+    branch = _clean_env(os.getenv("GITHUB_BRANCH", "main"), default="main") or "main"
+    token = _clean_env(os.getenv("GITHUB_TOKEN", ""))
+    if not token or not repo:
+        return {"handled": True, "success": False, "provider": "github", "message": "GitHub capability não está habilitada no ambiente."}
+    get_url = f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}"
+    status_get, body_get = _github_api_json("GET", get_url, None)
+    if status_get != 200:
+        return {"handled": True, "success": False, "provider": "github", "repo": repo, "branch": branch, "path": path, "message": f"O arquivo '{path}' não existe na branch '{branch}'."}
+    sha = ((body_get or {}).get("sha") or "").strip()
+    existing_bytes = ""
+    try:
+        existing_bytes = base64.b64decode(((body_get or {}).get("content") or "").encode("utf-8")).decode("utf-8", errors="replace")
+    except Exception:
+        existing_bytes = ""
+    new_content = content
+    if "adicion" in (trace_id or ""):
+        new_content = existing_bytes + ("\n" if existing_bytes and not existing_bytes.endswith("\n") else "") + content
+    payload = {"message": f"orkio: update {path}" + (f" [{trace_id}]" if trace_id else ""), "content": base64.b64encode(new_content.encode("utf-8")).decode("ascii"), "branch": branch, "sha": sha}
+    _github_log("GITHUB_UPDATE_ATTEMPT", repo=repo, branch=branch, path=path, trace_id=trace_id or "")
+    status_put, body_put = _github_api_json("PUT", f"https://api.github.com/repos/{repo}/contents/{path}", payload)
+    if status_put not in (200, 201):
+        _github_log("GITHUB_UPDATE_FAILED", repo=repo, branch=branch, path=path, status=status_put, trace_id=trace_id or "")
+        return {"handled": True, "success": False, "provider": "github", "repo": repo, "branch": branch, "path": path, "message": (body_put.get("message") if isinstance(body_put, dict) else None) or "Falha ao atualizar arquivo no GitHub."}
+    verified, _, verify_body = _github_verify_file_exists(repo, branch, path)
+    commit_sha = (((body_put or {}).get("commit") or {}).get("sha") or "").strip()
+    if not verified:
+        return {"handled": True, "success": False, "provider": "github", "repo": repo, "branch": branch, "path": path, "commit_sha": commit_sha, "message": f"Solicitação enviada ao GitHub, mas sem confirmação verificável de atualização do arquivo '{path}'."}
+    verified_sha = ((verify_body or {}).get("sha") or "").strip() or commit_sha
+    _github_log("GITHUB_UPDATE_VERIFY_OK", repo=repo, branch=branch, path=path, sha=verified_sha, trace_id=trace_id or "")
+    return {"handled": True, "success": True, "provider": "github", "repo": repo, "branch": branch, "path": path, "commit_sha": verified_sha, "message": "Arquivo atualizado com confirmação operacional verificável."}
+
+def _github_create_pull_request_capability(*, head: str, base: str, title: str, trace_id: Optional[str] = None) -> Dict[str, Any]:
+    repo = _clean_env(os.getenv("GITHUB_REPO", ""))
+    token = _clean_env(os.getenv("GITHUB_TOKEN", ""))
+    if not token or not repo:
+        return {"handled": True, "success": False, "provider": "github", "message": "GitHub capability não está habilitada no ambiente."}
+    payload = {"title": title, "head": head, "base": base, "body": f"PR criado pelo Orkio{f' [{trace_id}]' if trace_id else ''}"}
+    _github_log("GITHUB_PR_ATTEMPT", repo=repo, head=head, base=base, title=title, trace_id=trace_id or "")
+    status, body = _github_api_json("POST", f"https://api.github.com/repos/{repo}/pulls", payload)
+    if status not in (200, 201):
+        _github_log("GITHUB_PR_FAILED", repo=repo, head=head, base=base, status=status, trace_id=trace_id or "")
+        return {"handled": True, "success": False, "provider": "github", "repo": repo, "branch": head, "base_branch": base, "message": (body.get("message") if isinstance(body, dict) else None) or "Falha ao criar pull request no GitHub."}
+    number = int((body or {}).get("number") or 0)
+    html_url = str((body or {}).get("html_url") or "").strip()
+    pr_title = str((body or {}).get("title") or title).strip()
+    _github_log("GITHUB_PR_VERIFY_OK", repo=repo, head=head, base=base, number=number, trace_id=trace_id or "")
+    return {"handled": True, "success": True, "provider": "github", "repo": repo, "branch": head, "base_branch": base, "pull_request_number": number, "pull_request_url": html_url, "title": pr_title, "message": "Pull request criado com confirmação operacional verificável."}
+
 def _execute_capability_if_authorized(user_text: str, *, trace_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    req_pr = _extract_github_create_pr_request(user_text)
+    if req_pr:
+        return _github_create_pull_request_capability(
+            head=str(req_pr.get("head") or "").strip(),
+            base=str(req_pr.get("base") or "").strip(),
+            title=str(req_pr.get("title") or "").strip(),
+            trace_id=trace_id,
+        )
+
     req_branch = _extract_github_create_branch_request(user_text)
     if req_branch:
         if req_branch.get("invalid"):
@@ -4838,6 +5014,28 @@ def _execute_capability_if_authorized(user_text: str, *, trace_id: Optional[str]
             branch=str(req_branch.get("branch") or "").strip(),
             trace_id=trace_id,
         )
+
+    req_update = _extract_github_update_file_request(user_text)
+    if req_update:
+        if req_update.get("invalid") == "unsafe_path":
+            return {"handled": True, "success": False, "provider": "github", "message": "O caminho solicitado para o arquivo não é seguro."}
+        if req_update.get("invalid") == "missing_content":
+            return {"handled": True, "success": False, "provider": "github", "message": "Informe o conteúdo a ser aplicado na atualização."}
+        return _github_update_file_capability(
+            path=str(req_update.get("path") or "").strip(),
+            content=str(req_update.get("content") or "").strip(),
+            trace_id=trace_id,
+        )
+
+    req_list_files = _extract_github_list_files_request(user_text)
+    if req_list_files:
+        return _github_list_files_capability(
+            branch=str(req_list_files.get("branch") or "").strip(),
+            trace_id=trace_id,
+        )
+
+    if _extract_github_list_branches_request(user_text):
+        return _github_list_branches_capability(trace_id=trace_id)
 
     req = _extract_github_create_file_request(user_text)
     if not req:
