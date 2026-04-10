@@ -4534,6 +4534,35 @@ def _extract_github_create_file_request(user_text: str) -> Optional[Dict[str, st
     return {"path": path, "content": content}
 
 
+def _extract_github_create_branch_request(user_text: str) -> Optional[Dict[str, str]]:
+    txt = (user_text or "").strip()
+    if not txt:
+        return None
+    low = txt.lower()
+    if "branch" not in low:
+        return None
+
+    patterns = [
+        r"crie uma branch chamada[: ]+([A-Za-z0-9._/\-]{1,120})",
+        r"crie a branch[: ]+([A-Za-z0-9._/\-]{1,120})",
+        r"create a branch called[: ]+([A-Za-z0-9._/\-]{1,120})",
+        r"create branch[: ]+([A-Za-z0-9._/\-]{1,120})",
+    ]
+    branch = ""
+    for pat in patterns:
+        m = re.search(pat, txt, flags=re.IGNORECASE)
+        if m:
+            branch = (m.group(1) or "").strip()
+            break
+    if not branch:
+        return None
+    branch = re.sub(r"^refs/heads/", "", branch.strip())
+    if not branch or branch.startswith("/") or ".." in branch or "\\" in branch or " " in branch:
+        return {"invalid": "unsafe_branch"}
+    return {"branch": branch}
+
+
+
 def _build_execution_result_payload(result: Dict[str, Any]) -> str:
     if not result:
         return "Ação processada."
@@ -4552,8 +4581,11 @@ def _build_execution_result_payload(result: Dict[str, Any]) -> str:
         parts.append(f"repo: {repo}")
     if branch:
         parts.append(f"branch: {branch}")
+    base_branch = (result.get("base_branch") or "").strip()
     if path:
         parts.append(f"path: {path}")
+    if base_branch:
+        parts.append(f"base_branch: {base_branch}")
     if commit_sha:
         parts.append(f"commit: {commit_sha[:12]}")
     return "\n".join(parts)
@@ -4620,7 +4652,104 @@ def _github_create_file_capability(*, path: str, content: str, trace_id: Optiona
     }
 
 
+
+def _github_create_branch_capability(*, branch: str, trace_id: Optional[str] = None) -> Dict[str, Any]:
+    repo = _clean_env(os.getenv("GITHUB_REPO", ""))
+    base_branch = _clean_env(os.getenv("GITHUB_BRANCH", "main"), default="main") or "main"
+    token = _clean_env(os.getenv("GITHUB_TOKEN", ""))
+    if not token or not repo:
+        return {
+            "handled": True,
+            "success": False,
+            "provider": "github",
+            "message": "GitHub capability não está habilitada no ambiente.",
+        }
+
+    ref_url = f"https://api.github.com/repos/{repo}/git/ref/heads/{base_branch}"
+    status_ref, body_ref = _github_api_json("GET", ref_url, None)
+    if status_ref != 200:
+        return {
+            "handled": True,
+            "success": False,
+            "provider": "github",
+            "repo": repo,
+            "branch": base_branch,
+            "message": f"Não foi possível localizar a branch base '{base_branch}' no repositório configurado.",
+        }
+
+    try:
+        base_sha = (((body_ref or {}).get("object") or {}).get("sha") or "").strip()
+    except Exception:
+        base_sha = ""
+    if not base_sha:
+        return {
+            "handled": True,
+            "success": False,
+            "provider": "github",
+            "repo": repo,
+            "branch": base_branch,
+            "message": "Não foi possível resolver o SHA da branch base para criar a nova branch.",
+        }
+
+    exists_url = f"https://api.github.com/repos/{repo}/git/ref/heads/{branch}"
+    status_exists, _body_exists = _github_api_json("GET", exists_url, None)
+    if status_exists == 200:
+        return {
+            "handled": True,
+            "success": False,
+            "provider": "github",
+            "repo": repo,
+            "branch": branch,
+            "message": f"A branch '{branch}' já existe no repositório configurado.",
+        }
+
+    create_url = f"https://api.github.com/repos/{repo}/git/refs"
+    payload = {
+        "ref": f"refs/heads/{branch}",
+        "sha": base_sha,
+    }
+    status_create, body_create = _github_api_json("POST", create_url, payload)
+    if status_create not in (200, 201):
+        return {
+            "handled": True,
+            "success": False,
+            "provider": "github",
+            "repo": repo,
+            "branch": branch,
+            "message": f"GitHub não confirmou a criação da branch '{branch}' (status {status_create}).",
+            "raw": body_create,
+        }
+
+    created_ref = ((body_create or {}).get("ref") or "").strip()
+    created_sha = (((body_create or {}).get("object") or {}).get("sha") or "").strip()
+    return {
+        "handled": True,
+        "success": True,
+        "provider": "github",
+        "repo": repo,
+        "base_branch": base_branch,
+        "branch": branch,
+        "created_ref": created_ref,
+        "commit_sha": created_sha or base_sha,
+        "trace_id": trace_id,
+        "message": "Branch criada com confirmação operacional.",
+    }
+
 def _execute_capability_if_authorized(user_text: str, *, trace_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    req_branch = _extract_github_create_branch_request(user_text)
+    if req_branch:
+        if req_branch.get("invalid"):
+            return {
+                "handled": True,
+                "success": False,
+                "provider": "github",
+                "message": "O nome solicitado para a branch não é seguro.",
+            }
+        return _github_create_branch_capability(
+            branch=str(req_branch.get("branch") or "").strip(),
+            trace_id=trace_id,
+        )
+
     req = _extract_github_create_file_request(user_text)
     if not req:
         return None
