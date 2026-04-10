@@ -6799,13 +6799,20 @@ async def chat_stream(
                 except Exception:
                     pass
 
-            final_runtime_enrichment = _apply_execution_runtime(
-                runtime_enrichment,
-                executed_nodes=_stream_executed_nodes,
-                failed_nodes=_stream_failed_nodes,
-                started_at=_stream_started_at,
-                finished_at=now_ts(),
-            )
+            final_runtime_enrichment = runtime_enrichment if isinstance(runtime_enrichment, dict) else {}
+            try:
+                final_runtime_enrichment = dict(final_runtime_enrichment or {})
+                runtime_hints_block = final_runtime_enrichment.get("runtime_hints")
+                if not isinstance(runtime_hints_block, dict):
+                    runtime_hints_block = {}
+                runtime_hints_block["executed_nodes"] = list(_stream_executed_nodes or [])
+                runtime_hints_block["failed_nodes"] = list(_stream_failed_nodes or [])
+                runtime_hints_block["started_at"] = _stream_started_at
+                runtime_hints_block["finished_at"] = now_ts()
+                runtime_hints_block["agent_count"] = len(list(_stream_executed_nodes or []))
+                final_runtime_enrichment["runtime_hints"] = runtime_hints_block
+            except Exception:
+                final_runtime_enrichment = runtime_enrichment if isinstance(runtime_enrichment, dict) else {}
 
             # done global
             try:
