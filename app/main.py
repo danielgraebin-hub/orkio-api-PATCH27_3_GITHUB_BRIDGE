@@ -4364,6 +4364,84 @@ def _track_cost(
 
 
 
+
+
+def _ensure_execution_events_schema_runtime(db: Session) -> None:
+    """Best-effort runtime reconcile for execution_events used by review loop."""
+    try:
+        db.execute(text("""
+        CREATE TABLE IF NOT EXISTS execution_events (
+            id VARCHAR PRIMARY KEY,
+            org_slug VARCHAR NOT NULL,
+            trace_id VARCHAR,
+            thread_id VARCHAR,
+            planner_version VARCHAR,
+            primary_objective VARCHAR,
+            execution_strategy VARCHAR,
+            route_source VARCHAR,
+            route_applied BOOLEAN NOT NULL DEFAULT FALSE,
+            planned_nodes TEXT,
+            executed_nodes TEXT,
+            failed_nodes TEXT,
+            skipped_nodes TEXT,
+            planner_confidence NUMERIC(8,4) NOT NULL DEFAULT 0,
+            routing_confidence NUMERIC(8,4) NOT NULL DEFAULT 0,
+            token_cost_usd NUMERIC(12,6) NOT NULL DEFAULT 0,
+            latency_ms INTEGER NOT NULL DEFAULT 0,
+            metadata TEXT,
+            created_at BIGINT NOT NULL
+        )
+        """))
+        db.execute(text("CREATE INDEX IF NOT EXISTS ix_execution_events_org_created ON execution_events(org_slug, created_at)"))
+        db.execute(text("CREATE INDEX IF NOT EXISTS ix_execution_events_trace ON execution_events(trace_id)"))
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        try:
+            logger.exception("EXECUTION_EVENTS_SCHEMA_RUNTIME_RECONCILE_FAILED")
+        except Exception:
+            pass
+
+
+_EXECUTION_CLAIM_PATTERNS = [
+    r"\bfoi criado com sucesso\b",
+    r"\bfoi criada com sucesso\b",
+    r"\barquivo ['\"`].+?['\"`] .*\bfoi criado\b",
+    r"\bbranch ['\"`].+?['\"`] .*\bfoi criad[ao]\b",
+    r"\bcommit\b.*\brealizado\b",
+    r"\bpush\b.*\brealizado\b",
+    r"\bpull request\b.*\bcriad[ao]\b",
+    r"\bno reposit[oó]rio\b",
+]
+
+def _looks_like_external_execution_claim(answer: str) -> bool:
+    txt = (answer or "").strip().lower()
+    if not txt:
+        return False
+    return any(re.search(p, txt, flags=re.IGNORECASE | re.DOTALL) for p in _EXECUTION_CLAIM_PATTERNS)
+
+def _apply_truthful_execution_mode(answer: str, execution_result: Optional[Dict[str, Any]] = None) -> str:
+    """
+    Prevent the model from affirming external side effects without execution evidence.
+    If there is no real execution result, convert hard claims into an honest status.
+    """
+    txt = (answer or "").strip()
+    if not txt:
+        return txt
+    if execution_result and bool(execution_result.get("success")):
+        return txt
+    if not _looks_like_external_execution_claim(txt):
+        return txt
+    return (
+        "Não tenho confirmação operacional de que essa ação externa foi realmente executada. "
+        "Posso descrever o plano, preparar o patch ou orientar a execução, mas não devo afirmar "
+        "criação de arquivo, commit, push, branch ou alteração em repositório sem evidência concreta "
+        "de execução e retorno do provedor."
+    )
+
 def _track_execution_event(
     db: Session,
     *,
@@ -4375,6 +4453,7 @@ def _track_execution_event(
 ) -> None:
     """Persist lightweight execution telemetry for planner/routing learning. Fail-open only."""
     try:
+        _ensure_execution_events_schema_runtime(db)
         runtime_hints = runtime_hints or {}
         planner = runtime_hints.get("planner") if isinstance(runtime_hints.get("planner"), dict) else {}
         routing = runtime_hints.get("routing") if isinstance(runtime_hints.get("routing"), dict) else {}
@@ -6608,6 +6687,7 @@ def _read_recent_execution_events(db: Session, *, org: str, thread_id: Optional[
     except Exception:
         limit = 8
     try:
+        _ensure_execution_events_schema_runtime(db)
         sql = """
             SELECT trace_id, thread_id, planner_version, primary_objective,
                    execution_strategy, route_source, route_applied,
@@ -7185,7 +7265,7 @@ async def chat_stream(
                         return
                     continue
 
-                ans = (ans_obj.get("text") or "").strip()
+                ans = _apply_truthful_execution_mode((ans_obj.get("text") or "").strip(), execution_result=None)
 
                 # Persist assistant message (DB path can fail; must rollback)
                 try:
@@ -7719,7 +7799,7 @@ async def orchestrate(
                     return
                 continue
 
-            ans = (ans_obj.get("text") or "").strip()
+            ans = _apply_truthful_execution_mode((ans_obj.get("text") or "").strip(), execution_result=None)
 
             # Persist
             try:
