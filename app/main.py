@@ -6435,6 +6435,166 @@ class TTSIn(BaseModel):
     message_id: Optional[str] = None  # STAB: resolve agent (and voice) from persisted message
 
 
+
+
+def _json_load_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(x).strip() for x in value if str(x).strip()]
+    raw = str(value).strip()
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return [str(x).strip() for x in data if str(x).strip()]
+    except Exception:
+        pass
+    return []
+
+
+def _read_recent_execution_events(db: Session, *, org: str, thread_id: Optional[str] = None, limit: int = 8) -> List[Dict[str, Any]]:
+    """Read recent execution telemetry in fail-open mode."""
+    try:
+        limit = max(1, min(int(limit or 8), 20))
+    except Exception:
+        limit = 8
+    try:
+        sql = """
+            SELECT trace_id, thread_id, planner_version, primary_objective,
+                   execution_strategy, route_source, route_applied,
+                   planned_nodes, executed_nodes, failed_nodes, skipped_nodes,
+                   planner_confidence, routing_confidence, token_cost_usd,
+                   latency_ms, metadata, created_at
+            FROM execution_events
+            WHERE org_slug = :org_slug
+        """
+        params: Dict[str, Any] = {"org_slug": org, "limit": limit}
+        if thread_id:
+            sql += " AND thread_id = :thread_id"
+            params["thread_id"] = thread_id
+        sql += " ORDER BY created_at DESC LIMIT :limit"
+        rows = db.execute(text(sql), params).mappings().all()
+        return [dict(r) for r in rows]
+    except Exception:
+        try:
+            logger.exception("EXECUTION_EVENTS_READ_FAILED org=%s thread_id=%s", org, thread_id)
+        except Exception:
+            pass
+        return []
+
+
+def _build_execution_review_snapshot(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Build a compact recent-execution summary for planner learning."""
+    if not rows:
+        return {
+            "recent_count": 0,
+            "avg_latency_ms": 0,
+            "avg_planner_confidence": 0.0,
+            "avg_routing_confidence": 0.0,
+            "top_primary_objectives": [],
+            "top_execution_strategies": [],
+            "recent_executed_nodes": [],
+            "recent_failed_nodes": [],
+            "route_applied_rate": 0.0,
+            "last_trace_id": None,
+        }
+
+    objective_counts: Dict[str, int] = {}
+    strategy_counts: Dict[str, int] = {}
+    node_counts: Dict[str, int] = {}
+    fail_counts: Dict[str, int] = {}
+    latency_values: List[int] = []
+    planner_conf_values: List[float] = []
+    routing_conf_values: List[float] = []
+    route_applied_true = 0
+
+    for row in rows:
+        obj = str(row.get("primary_objective") or "").strip()
+        if obj:
+            objective_counts[obj] = objective_counts.get(obj, 0) + 1
+
+        strat = str(row.get("execution_strategy") or "").strip()
+        if strat:
+            strategy_counts[strat] = strategy_counts.get(strat, 0) + 1
+
+        for node in _json_load_list(row.get("executed_nodes")):
+            node_counts[node] = node_counts.get(node, 0) + 1
+
+        for node in _json_load_list(row.get("failed_nodes")):
+            fail_counts[node] = fail_counts.get(node, 0) + 1
+
+        try:
+            latency_values.append(max(0, int(row.get("latency_ms") or 0)))
+        except Exception:
+            pass
+        try:
+            planner_conf_values.append(float(row.get("planner_confidence") or 0.0))
+        except Exception:
+            pass
+        try:
+            routing_conf_values.append(float(row.get("routing_confidence") or 0.0))
+        except Exception:
+            pass
+        if bool(row.get("route_applied")):
+            route_applied_true += 1
+
+    def _top_counts(d: Dict[str, int], n: int = 3) -> List[str]:
+        return [k for k, _ in sorted(d.items(), key=lambda kv: (-kv[1], kv[0]))[:n]]
+
+    recent_count = len(rows)
+    avg_latency_ms = int(sum(latency_values) / len(latency_values)) if latency_values else 0
+    avg_planner_confidence = round(sum(planner_conf_values) / len(planner_conf_values), 3) if planner_conf_values else 0.0
+    avg_routing_confidence = round(sum(routing_conf_values) / len(routing_conf_values), 3) if routing_conf_values else 0.0
+    route_applied_rate = round(route_applied_true / recent_count, 3) if recent_count else 0.0
+
+    return {
+        "recent_count": recent_count,
+        "avg_latency_ms": avg_latency_ms,
+        "avg_planner_confidence": avg_planner_confidence,
+        "avg_routing_confidence": avg_routing_confidence,
+        "top_primary_objectives": _top_counts(objective_counts),
+        "top_execution_strategies": _top_counts(strategy_counts),
+        "recent_executed_nodes": _top_counts(node_counts, 5),
+        "recent_failed_nodes": _top_counts(fail_counts, 5),
+        "route_applied_rate": route_applied_rate,
+        "last_trace_id": rows[0].get("trace_id"),
+    }
+
+
+def _build_execution_planner_adjustment(review: Dict[str, Any]) -> Dict[str, Any]:
+    """Lightweight, non-invasive planner adjustment hints based on recent telemetry."""
+    review = review or {}
+    failed_nodes = [str(x).strip().lower() for x in (review.get("recent_failed_nodes") or []) if str(x).strip()]
+    executed_nodes = [str(x).strip().lower() for x in (review.get("recent_executed_nodes") or []) if str(x).strip()]
+    avg_latency_ms = int(review.get("avg_latency_ms") or 0)
+    route_applied_rate = float(review.get("route_applied_rate") or 0.0)
+
+    preferred_visible_node = executed_nodes[0] if executed_nodes else None
+    avoid_nodes = failed_nodes[:3]
+
+    if avg_latency_ms >= 12000:
+        latency_mode = "cost_and_latency_guarded"
+    elif avg_latency_ms >= 7000:
+        latency_mode = "latency_guarded"
+    else:
+        latency_mode = "normal"
+
+    if route_applied_rate >= 0.6:
+        routing_bias = "allow_adaptive_routing"
+    else:
+        routing_bias = "prefer_stable_default_path"
+
+    return {
+        "preferred_visible_node": preferred_visible_node,
+        "avoid_nodes": avoid_nodes,
+        "latency_mode": latency_mode,
+        "routing_bias": routing_bias,
+        "confidence_floor": 0.58 if avoid_nodes else 0.52,
+        "source": "execution_review_v7",
+    }
+
 @app.post("/api/chat/stream")
 async def chat_stream(
     inp: ChatIn,
@@ -6934,6 +7094,19 @@ async def chat_stream(
                     runtime_hints=(final_runtime_enrichment.get("runtime_hints") if isinstance(final_runtime_enrichment, dict) else {}) or {},
                     token_cost_usd=0.0,
                 )
+            except Exception:
+                pass
+
+            # enrich final runtime hints with recent execution review (v7, fail-open)
+            try:
+                _runtime_hints_out = (final_runtime_enrichment.get("runtime_hints") if isinstance(final_runtime_enrichment, dict) else {}) or {}
+                recent_execution_rows = _read_recent_execution_events(db, org=org, thread_id=tid, limit=8)
+                execution_review = _build_execution_review_snapshot(recent_execution_rows)
+                planner_adjustment = _build_execution_planner_adjustment(execution_review)
+                if isinstance(_runtime_hints_out, dict):
+                    _runtime_hints_out["execution_review"] = execution_review
+                    _runtime_hints_out["planner_adjustment"] = planner_adjustment
+                    final_runtime_enrichment["runtime_hints"] = _runtime_hints_out
             except Exception:
                 pass
 
