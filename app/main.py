@@ -4477,14 +4477,18 @@ def chat(
 
     # Parse @mentions
     mention_tokens: List[str] = []
+    requested_names = _detect_requested_agent_names(inp.message or "")
     try:
         mention_tokens = re.findall(r"@([A-Za-z0-9_\-]{2,64})", inp.message or "")
+        for req in requested_names:
+            if req:
+                mention_tokens.append(req)
         seen: set = set()
         mention_tokens = [m for m in mention_tokens if not (m.lower() in seen or seen.add(m.lower()))]
     except Exception:
-        mention_tokens = []
+        mention_tokens = [str(x) for x in requested_names]
 
-    has_team = any(m.strip().lower() in ("time", "team") for m in mention_tokens)
+    has_team = any(m.strip().lower() in ("time", "team") for m in mention_tokens) or len(requested_names) > 1
 
     # Build alias map once
     all_agents = db.execute(select(Agent).where(Agent.org_slug == org)).scalars().all()
@@ -4500,6 +4504,7 @@ def chat(
 
     # STAB: select_target_agents — determinístico, nunca sobrescrito
     target_agents = _select_target_agents(db, org, inp, alias_to_agent, mention_tokens, has_team)
+    target_agents = _apply_explicit_agent_request(db, org, target_agents, requested_names)
 
     # Init accumulators
     answers: List[str] = []
@@ -4547,10 +4552,13 @@ def chat(
         execution_review = _build_execution_review_snapshot(recent_execution_rows)
         planner_adjustment = _build_execution_planner_adjustment(execution_review)
         target_agents = _apply_execution_planner_adjustment(target_agents, planner_adjustment)
+        target_agents = _apply_explicit_agent_request(db, org, target_agents, requested_names)
         runtime_hints_live = runtime_enrichment.get("runtime_hints") if isinstance(runtime_enrichment.get("runtime_hints"), dict) else {}
         if isinstance(runtime_hints_live, dict):
             runtime_hints_live["execution_review"] = execution_review
             runtime_hints_live["planner_adjustment"] = planner_adjustment
+            runtime_hints_live["explicit_requested_agents"] = requested_names
+            runtime_hints_live["multi_agent_requested"] = len(requested_names) > 1 or has_team
             runtime_enrichment["runtime_hints"] = runtime_hints_live
     except Exception:
         pass
@@ -6731,8 +6739,66 @@ def _build_execution_planner_adjustment(review: Dict[str, Any]) -> Dict[str, Any
         "latency_mode": latency_mode,
         "routing_bias": routing_bias,
         "confidence_floor": 0.58 if avoid_nodes else 0.52,
-        "source": "execution_review_v8",
+        "source": "execution_review_v9",
     }
+
+
+def _apply_explicit_agent_request(db: Session, org: str, target_agents: List[Any], requested_names: Optional[List[str]]) -> List[Any]:
+    """Force explicit specialist execution for chat/chat_stream.
+    - If the user explicitly asks for Orion/Chris/Orkio, prefer those agents.
+    - When multiple specialists are requested, do not keep host-only fallback.
+    - Preserve the explicit order requested by the user.
+    """
+    requested_names = [str(x).strip() for x in (requested_names or []) if str(x).strip()]
+    if not requested_names:
+        return target_agents
+
+    requested_norm = [x.lower() for x in requested_names]
+    requested_set = set(requested_norm)
+
+    def _agent_name(ag: Any) -> str:
+        if isinstance(ag, dict):
+            return str(ag.get("name") or "").strip()
+        return str(getattr(ag, "name", "") or "").strip()
+
+    by_name: Dict[str, Any] = {}
+    for ag in target_agents or []:
+        name = _agent_name(ag)
+        if not name:
+            continue
+        full = name.lower()
+        first = full.split()[0] if full.split() else full
+        by_name.setdefault(full, ag)
+        by_name.setdefault(first, ag)
+
+    ordered: List[Any] = []
+    seen_ids: set = set()
+
+    for req in requested_norm:
+        ag = by_name.get(req)
+        if ag is None:
+            continue
+        agid = ag.get("id") if isinstance(ag, dict) else getattr(ag, "id", None)
+        if agid not in seen_ids:
+            ordered.append(ag)
+            seen_ids.add(agid)
+
+    if len(ordered) != len(requested_names):
+        fallback_agents = list(
+            db.execute(
+                select(Agent).where(
+                    Agent.org_slug == org,
+                    func.lower(Agent.name).in_(requested_norm),
+                )
+            ).scalars().all()
+        )
+        for ag in fallback_agents:
+            agid = getattr(ag, "id", None)
+            if agid not in seen_ids:
+                ordered.append(ag)
+                seen_ids.add(agid)
+
+    return ordered or target_agents
 
 @app.post("/api/chat/stream")
 async def chat_stream(
@@ -6815,14 +6881,18 @@ async def chat_stream(
 
     # Resolve target agents (align /api/chat/stream with /api/chat)
     mention_tokens: List[str] = []
+    requested_names = _detect_requested_agent_names(message or "")
     try:
         mention_tokens = re.findall(r"@([A-Za-z0-9_\-]{2,64})", message or "")
+        for req in requested_names:
+            if req:
+                mention_tokens.append(req)
         seen_mentions: set = set()
         mention_tokens = [m for m in mention_tokens if not (m.lower() in seen_mentions or seen_mentions.add(m.lower()))]
     except Exception:
-        mention_tokens = []
+        mention_tokens = [str(x) for x in requested_names]
 
-    has_team = any(m.strip().lower() in ("time", "team") for m in mention_tokens)
+    has_team = any(m.strip().lower() in ("time", "team") for m in mention_tokens) or len(requested_names) > 1
 
     all_agents_rows = db.execute(select(Agent).where(Agent.org_slug == org)).scalars().all()
     alias_to_agent: Dict[str, Any] = {}
@@ -6836,6 +6906,7 @@ async def chat_stream(
             alias_to_agent.setdefault(first, a)
 
     target_agents_rows = _select_target_agents(db, org, inp, alias_to_agent, mention_tokens, has_team)
+    target_agents_rows = _apply_explicit_agent_request(db, org, target_agents_rows, requested_names)
 
     if not target_agents_rows:
         raise HTTPException(400, "no agents configured")
@@ -6925,10 +6996,13 @@ async def chat_stream(
         execution_review = _build_execution_review_snapshot(recent_execution_rows)
         planner_adjustment = _build_execution_planner_adjustment(execution_review)
         target_agents = _apply_execution_planner_adjustment(target_agents, planner_adjustment)
+        target_agents = _apply_explicit_agent_request(db, org, target_agents, requested_names)
         runtime_hints_live = runtime_enrichment.get("runtime_hints") if isinstance(runtime_enrichment.get("runtime_hints"), dict) else {}
         if isinstance(runtime_hints_live, dict):
             runtime_hints_live["execution_review"] = execution_review
             runtime_hints_live["planner_adjustment"] = planner_adjustment
+            runtime_hints_live["explicit_requested_agents"] = requested_names
+            runtime_hints_live["multi_agent_requested"] = len(requested_names) > 1 or has_team
             runtime_enrichment["runtime_hints"] = runtime_hints_live
     except Exception:
         pass
@@ -8327,6 +8401,7 @@ def _detect_requested_agent_names(message: str) -> List[str]:
         return []
     requested: List[str] = []
     patterns = [
+        ("Orkio", [r"@orkio\b", r"\borkio\b", r"host\b", r"moderador", r"moderator"]),
         ("Chris", [r"@chris\b", r"\bchris\b", r"\bcfo\b", r"financeir", r"financial", r"financ"]),
         ("Orion", [r"@orion\b", r"\borion\b", r"\bcto\b", r"tecnolog", r"technical", r"arquitetur", r"engineering"]),
     ]
