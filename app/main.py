@@ -4428,6 +4428,40 @@ def _get_runtime_capability_registry() -> Dict[str, Any]:
     }
 
 
+
+
+def _is_capability_inventory_request(user_text: str) -> bool:
+    txt = (user_text or "").strip().lower()
+    if not txt:
+        return False
+    patterns = [
+        r"quais capabilit(?:y|ies)",
+        r"quais capacidades operacionais",
+        r"what capabilities",
+        r"capabilities operacionais",
+        r"capacidade[s]? operacionais",
+    ]
+    return any(re.search(p, txt, flags=re.IGNORECASE) for p in patterns)
+
+def _build_capability_inventory_text() -> str:
+    reg = _get_runtime_capability_registry()
+    available = list(reg.get("available") or [])
+    github = reg.get("github") if isinstance(reg.get("github"), dict) else {}
+    if not available:
+        return (
+            "No momento, não há capabilities operacionais confirmadas em runtime. "
+            "Posso descrever capacidades conceituais, mas não afirmar disponibilidade técnica sem registro operacional."
+        )
+    lines = ["Capabilities operacionais ativas agora:"]
+    for item in available:
+        lines.append(f"- {item}")
+    if github.get("enabled"):
+        lines.append("")
+        lines.append(f"GitHub repo: {github.get('repo') or 'n/d'}")
+        lines.append(f"GitHub branch padrão: {github.get('branch') or 'main'}")
+        lines.append(f"GitHub write_enabled: {bool(github.get('write_enabled'))}")
+    return "\n".join(lines)
+
 def _github_headers() -> Dict[str, str]:
     token = _clean_env(os.getenv("GITHUB_TOKEN", ""))
     return {
@@ -4920,9 +4954,13 @@ def chat(
             effective_system_prompt = ((effective_system_prompt or "").strip() + "\n\nFounder guidance (temporary, internal):\n" + active_founder_guidance).strip()
 
         execution_result = None
+        capability_inventory_answer = None
         if blocked_reply is None:
             try:
-                execution_result = _execute_capability_if_authorized(inp.message, trace_id=getattr(inp, "trace_id", None))
+                if _is_capability_inventory_request(inp.message):
+                    capability_inventory_answer = _build_capability_inventory_text()
+                else:
+                    execution_result = _execute_capability_if_authorized(inp.message, trace_id=getattr(inp, "trace_id", None))
             except Exception:
                 execution_result = {
                     "handled": True,
@@ -4931,7 +4969,13 @@ def chat(
                     "message": "Falha ao avaliar capability operacional solicitada.",
                 }
 
-        if execution_result and execution_result.get("handled"):
+        if capability_inventory_answer is not None:
+            ans_obj = {
+                "text": capability_inventory_answer,
+                "usage": None,
+                "model": "runtime_capability_inventory",
+            }
+        elif execution_result and execution_result.get("handled"):
             ans_obj = {
                 "text": _build_execution_result_payload(execution_result),
                 "usage": None,
@@ -5419,6 +5463,13 @@ def _build_runtime_enrichment(
         trial_analytics=trial_analytics,
         dag_snapshot=dag_snapshot,
     )
+    try:
+        if isinstance(runtime_hints, dict):
+            runtime_hints["capabilities"] = _get_runtime_capability_registry()
+        else:
+            runtime_hints = {"capabilities": _get_runtime_capability_registry()}
+    except Exception:
+        pass
     return {
         "intent_package": intent_package,
         "first_win_plan": first_win_plan,
@@ -7405,9 +7456,13 @@ async def chat_stream(
                 history_dicts = list(stream_history_seed[-24:])
 
                 execution_result = None
+                capability_inventory_answer = None
                 if blocked_reply is None:
                     try:
-                        execution_result = _execute_capability_if_authorized(message, trace_id=trace_id)
+                        if _is_capability_inventory_request(message):
+                            capability_inventory_answer = _build_capability_inventory_text()
+                        else:
+                            execution_result = _execute_capability_if_authorized(message, trace_id=trace_id)
                     except Exception:
                         execution_result = {
                             "handled": True,
@@ -7417,7 +7472,7 @@ async def chat_stream(
                         }
 
                 llm_task = None
-                if not (execution_result and execution_result.get("handled")):
+                if capability_inventory_answer is None and not (execution_result and execution_result.get("handled")):
                     llm_task = asyncio.create_task(
                         asyncio.to_thread(
                             _openai_answer,
@@ -7465,7 +7520,9 @@ async def chat_stream(
                             return
                     await asyncio.sleep(LLM_WAIT_POLL)
 
-                if execution_result and execution_result.get("handled"):
+                if capability_inventory_answer is not None:
+                    ans_obj = {"text": capability_inventory_answer, "usage": None, "model": "runtime_capability_inventory"}
+                elif execution_result and execution_result.get("handled"):
                     ans_obj = {"text": _build_execution_result_payload(execution_result), "usage": None, "model": "github_capability"}
                 else:
                     ans_obj = {"text": blocked_reply, "usage": None, "model": "summit_guard"} if blocked_reply is not None else await llm_task
