@@ -10723,3 +10723,42 @@ def admin_update_user_tier(user_id: str, tier: str = "summit_standard", admin=De
     db.add(u)
     db.commit()
     return {"ok": True, "id": u.id, "usage_tier": tier}
+
+
+
+# =========================
+# PATCH v11b SAFE LAYER
+# execution_events bootstrap + capability registry stub
+# =========================
+
+def _ensure_execution_events_schema_runtime(db):
+    try:
+        db.execute("SELECT 1 FROM execution_events LIMIT 1;")
+    except Exception:
+        try:
+            db.execute("""
+            CREATE TABLE IF NOT EXISTS execution_events (
+                id SERIAL PRIMARY KEY,
+                event_type TEXT,
+                agent TEXT,
+                status TEXT,
+                metadata TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+            """)
+            db.commit()
+        except Exception:
+            pass
+
+
+def _get_runtime_capability_registry():
+    return {
+        "github_write_file_stub": {
+            "enabled": False,
+            "description": "Stub capability for GitHub file write"
+        },
+        "github_create_branch_stub": {
+            "enabled": False,
+            "description": "Stub capability for GitHub branch creation"
+        }
+    }
