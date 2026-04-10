@@ -4193,6 +4193,10 @@ def _track_cost(
             tid, (agent.id if agent else None), prompt_t, completion_t, float(total_usd), streaming, usage_missing or estimated,
         )
     except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
         logger.exception("COST_EVENT_PERSIST_FAILED")
 
 @app.post("/api/chat", response_model=ChatOut)
@@ -6478,6 +6482,16 @@ async def chat_stream(
         ).scalars().all()
     )
 
+    prev_history_seed: List[Dict[str, str]] = []
+    try:
+        for pm in prev[-24:]:
+            role = getattr(pm, "role", "") or ""
+            content = getattr(pm, "content", "") or ""
+            if role and content:
+                prev_history_seed.append({"role": role, "content": content})
+    except Exception:
+        prev_history_seed = []
+
     try:
         runtime_enrichment = _build_runtime_enrichment(
             db,
@@ -6530,6 +6544,7 @@ async def chat_stream(
         LLM_WAIT_POLL = 1.0
 
         try:
+            stream_history_seed = list(prev_history_seed)
             for ag in target_agents:
                 if await request.is_disconnected():
                     return
@@ -6588,13 +6603,8 @@ async def chat_stream(
                 model_override = ag_model
                 temperature = float(ag_temperature_raw if ag_temperature_raw not in (None, "") else 0.2) or 0.2
 
-                # Patch D: convert ORM Message objects to dicts for _openai_answer
-                history_dicts = []
-                for pm in prev[-24:]:
-                    role = getattr(pm, "role", "") or ""
-                    content = getattr(pm, "content", "") or ""
-                    if role and content:
-                        history_dicts.append({"role": role, "content": content})
+                # Stable streaming history: never depend on ORM Message instances after commit/rollback
+                history_dicts = list(stream_history_seed[-24:])
 
                 llm_task = asyncio.create_task(
                     asyncio.to_thread(
@@ -6780,6 +6790,14 @@ async def chat_stream(
                     yield sse_event("agent_done", {"done": True, "agent_id": ag_id, "thread_id": tid, "trace_id": trace_id})
                 except Exception:
                     return
+
+                try:
+                    if ans:
+                        stream_history_seed.append({"role": "assistant", "content": ans})
+                        if len(stream_history_seed) > 24:
+                            stream_history_seed = stream_history_seed[-24:]
+                except Exception:
+                    pass
 
             final_runtime_enrichment = _apply_execution_runtime(
                 runtime_enrichment,
