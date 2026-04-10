@@ -6769,7 +6769,7 @@ async def chat_stream(
                 except Exception:
                     return
 
-            runtime_enrichment = _apply_execution_runtime(
+            final_runtime_enrichment = _apply_execution_runtime(
                 runtime_enrichment,
                 executed_nodes=_stream_executed_nodes,
                 failed_nodes=_stream_failed_nodes,
@@ -6780,8 +6780,8 @@ async def chat_stream(
             # done global
             try:
                 payload = {"done": True, "thread_id": tid, "trace_id": trace_id}
-                if runtime_enrichment and runtime_enrichment.get("runtime_hints"):
-                    payload["runtime_hints"] = runtime_enrichment.get("runtime_hints")
+                if final_runtime_enrichment and final_runtime_enrichment.get("runtime_hints"):
+                    payload["runtime_hints"] = final_runtime_enrichment.get("runtime_hints")
                 yield sse_event("done", payload)
             except Exception:
                 return
