@@ -4,6 +4,7 @@ import os
 import logging
 import hashlib
 import json, time, uuid, re
+import base64
 import asyncio
 import jwt
 from typing import Any, Dict, List, Optional
@@ -4406,6 +4407,203 @@ def _ensure_execution_events_schema_runtime(db: Session) -> None:
             pass
 
 
+
+def _get_runtime_capability_registry() -> Dict[str, Any]:
+    """Runtime-safe capability exposure used by runtime_hints and execution guards."""
+    github_enabled = bool(_clean_env(os.getenv("GITHUB_TOKEN", "")) and _clean_env(os.getenv("GITHUB_REPO", "")))
+    available: List[str] = []
+    if github_enabled:
+        available.extend([
+            "github_create_file",
+            "github_create_branch",
+        ])
+    return {
+        "available": available,
+        "github": {
+            "enabled": github_enabled,
+            "repo": _clean_env(os.getenv("GITHUB_REPO", "")),
+            "branch": _clean_env(os.getenv("GITHUB_BRANCH", "main"), default="main") or "main",
+            "write_enabled": github_enabled,
+        },
+    }
+
+
+def _github_headers() -> Dict[str, str]:
+    token = _clean_env(os.getenv("GITHUB_TOKEN", ""))
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "orkio-backend/1.0",
+        "Content-Type": "application/json",
+    }
+
+
+def _github_api_json(method: str, url: str, payload: Optional[Dict[str, Any]] = None) -> tuple[int, Dict[str, Any]]:
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+    req = _urllib_request.Request(url, data=data, headers=_github_headers(), method=method.upper())
+    ctx = _ssl.create_default_context()
+    try:
+        with _urllib_request.urlopen(req, context=ctx, timeout=15) as resp:
+            raw = resp.read().decode("utf-8", errors="replace") or "{}"
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                parsed = {"raw": raw}
+            return int(getattr(resp, "status", 200) or 200), parsed
+    except Exception as e:
+        status = getattr(e, "code", 0) or 0
+        body = getattr(e, "read", None)
+        parsed: Dict[str, Any] = {}
+        try:
+            if body:
+                raw = body().decode("utf-8", errors="replace") or "{}"
+                parsed = json.loads(raw)
+        except Exception:
+            parsed = {}
+        if not parsed:
+            parsed = {"message": str(e)}
+        return int(status), parsed
+
+
+def _extract_github_create_file_request(user_text: str) -> Optional[Dict[str, str]]:
+    txt = (user_text or "").strip()
+    if not txt:
+        return None
+    low = txt.lower()
+    if "github" not in low:
+        return None
+
+    patterns = [
+        r"crie um arquivo no github chamado[: ]+([A-Za-z0-9._/\-]{1,120})",
+        r"crie um arquivo chamado[: ]+([A-Za-z0-9._/\-]{1,120}).{0,40}?github",
+        r"crie o arquivo[: ]+([A-Za-z0-9._/\-]{1,120}).{0,40}?github",
+        r"create a file on github called[: ]+([A-Za-z0-9._/\-]{1,120})",
+    ]
+    path = ""
+    for pat in patterns:
+        m = re.search(pat, txt, flags=re.IGNORECASE)
+        if m:
+            path = (m.group(1) or "").strip()
+            break
+    if not path:
+        return None
+    if path.startswith("/") or ".." in path or "\\" in path:
+        return {"invalid": "unsafe_path"}
+    content = ""
+    m_content = re.search(r"(?:conte[uú]do|content)[: ]+(.+)$", txt, flags=re.IGNORECASE | re.DOTALL)
+    if m_content:
+        content = (m_content.group(1) or "").strip()
+    if not content:
+        content = "created by Orkio GitHub capability\n"
+    return {"path": path, "content": content}
+
+
+def _build_execution_result_payload(result: Dict[str, Any]) -> str:
+    if not result:
+        return "Ação processada."
+    if not result.get("success"):
+        msg = (result.get("message") or "Não foi possível concluir a ação solicitada.").strip()
+        return msg
+    provider = (result.get("provider") or "provider").strip()
+    repo = (result.get("repo") or "").strip()
+    branch = (result.get("branch") or "").strip()
+    path = (result.get("path") or "").strip()
+    commit_sha = (result.get("commit_sha") or "").strip()
+    parts = ["Ação executada com confirmação operacional."]
+    if provider:
+        parts.append(f"provider: {provider}")
+    if repo:
+        parts.append(f"repo: {repo}")
+    if branch:
+        parts.append(f"branch: {branch}")
+    if path:
+        parts.append(f"path: {path}")
+    if commit_sha:
+        parts.append(f"commit: {commit_sha[:12]}")
+    return "\n".join(parts)
+
+
+def _github_create_file_capability(*, path: str, content: str, trace_id: Optional[str] = None) -> Dict[str, Any]:
+    repo = _clean_env(os.getenv("GITHUB_REPO", ""))
+    branch = _clean_env(os.getenv("GITHUB_BRANCH", "main"), default="main") or "main"
+    token = _clean_env(os.getenv("GITHUB_TOKEN", ""))
+    if not token or not repo:
+        return {
+            "handled": True,
+            "success": False,
+            "provider": "github",
+            "message": "GitHub capability não está habilitada no ambiente.",
+        }
+
+    get_url = f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}"
+    status_get, body_get = _github_api_json("GET", get_url, None)
+    if status_get == 200:
+        return {
+            "handled": True,
+            "success": False,
+            "provider": "github",
+            "repo": repo,
+            "branch": branch,
+            "path": path,
+            "message": f"O arquivo '{path}' já existe no repositório configurado.",
+        }
+
+    payload = {
+        "message": f"orkio: create {path}" + (f" [{trace_id}]" if trace_id else ""),
+        "content": base64.b64encode((content or "").encode("utf-8")).decode("ascii"),
+        "branch": branch,
+    }
+    put_url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    status_put, body_put = _github_api_json("PUT", put_url, payload)
+    if status_put not in (200, 201):
+        return {
+            "handled": True,
+            "success": False,
+            "provider": "github",
+            "repo": repo,
+            "branch": branch,
+            "path": path,
+            "message": (body_put.get("message") if isinstance(body_put, dict) else None) or "Falha ao criar arquivo no GitHub.",
+        }
+
+    commit_sha = ""
+    try:
+        commit_sha = (((body_put or {}).get("commit") or {}).get("sha") or "").strip()
+    except Exception:
+        commit_sha = ""
+    return {
+        "handled": True,
+        "success": True,
+        "provider": "github",
+        "repo": repo,
+        "branch": branch,
+        "path": path,
+        "commit_sha": commit_sha,
+        "trace_id": trace_id,
+        "message": "Arquivo criado com confirmação operacional.",
+    }
+
+
+def _execute_capability_if_authorized(user_text: str, *, trace_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    req = _extract_github_create_file_request(user_text)
+    if not req:
+        return None
+    if req.get("invalid"):
+        return {
+            "handled": True,
+            "success": False,
+            "provider": "github",
+            "message": "O caminho solicitado para o arquivo não é seguro.",
+        }
+    return _github_create_file_capability(
+        path=str(req.get("path") or "").strip(),
+        content=str(req.get("content") or "").strip(),
+        trace_id=trace_id,
+    )
+
+
 _EXECUTION_CLAIM_PATTERNS = [
     r"\bfoi criado com sucesso\b",
     r"\bfoi criada com sucesso\b",
@@ -4721,15 +4919,36 @@ def chat(
         if active_founder_guidance:
             effective_system_prompt = ((effective_system_prompt or "").strip() + "\n\nFounder guidance (temporary, internal):\n" + active_founder_guidance).strip()
 
-        ans_obj = _openai_answer(
-            user_msg if blocked_reply is None else inp.message,
-            citations,
-            history=history,
-            system_prompt=effective_system_prompt,
-            model_override=(agent.model if agent else None),
-            temperature=temperature,
-        )
+        execution_result = None
+        if blocked_reply is None:
+            try:
+                execution_result = _execute_capability_if_authorized(inp.message, trace_id=getattr(inp, "trace_id", None))
+            except Exception:
+                execution_result = {
+                    "handled": True,
+                    "success": False,
+                    "provider": "github",
+                    "message": "Falha ao avaliar capability operacional solicitada.",
+                }
+
+        if execution_result and execution_result.get("handled"):
+            ans_obj = {
+                "text": _build_execution_result_payload(execution_result),
+                "usage": None,
+                "model": "github_capability",
+            }
+        else:
+            ans_obj = _openai_answer(
+                user_msg if blocked_reply is None else inp.message,
+                citations,
+                history=history,
+                system_prompt=effective_system_prompt,
+                model_override=(agent.model if agent else None),
+                temperature=temperature,
+            )
         answer = blocked_reply or (ans_obj.get("text") if ans_obj else None)
+
+        answer = _apply_truthful_execution_mode(answer or "", execution_result=execution_result)
 
         if ans_obj and ans_obj.get("code") and not answer:
             # surface structured error
@@ -4819,7 +5038,11 @@ def chat(
         "agent_name": last_agent.name if last_agent else None,
         "voice_id": resolve_agent_voice(last_agent) if last_agent else None,
         "avatar_url": getattr(last_agent, 'avatar_url', None) if last_agent else None,
-        "runtime_hints": runtime_enrichment.get("runtime_hints") if runtime_enrichment else None,
+        "runtime_hints": (
+            (lambda _rh: (dict(_rh, capabilities=_get_runtime_capability_registry()) if isinstance(_rh, dict) else {"capabilities": _get_runtime_capability_registry()}))(
+                runtime_enrichment.get("runtime_hints") if runtime_enrichment else None
+            )
+        ),
     }
 
 def _safe_json_loads(raw: Any, default: Any):
@@ -7181,17 +7404,31 @@ async def chat_stream(
                 # Stable streaming history: never depend on ORM Message instances after commit/rollback
                 history_dicts = list(stream_history_seed[-24:])
 
-                llm_task = asyncio.create_task(
-                    asyncio.to_thread(
-                        _openai_answer,
-                        user_msg if blocked_reply is None else blocked_reply,
-                        citations,
-                        history_dicts,
-                        system_prompt,
-                        model_override,
-                        temperature,
+                execution_result = None
+                if blocked_reply is None:
+                    try:
+                        execution_result = _execute_capability_if_authorized(message, trace_id=trace_id)
+                    except Exception:
+                        execution_result = {
+                            "handled": True,
+                            "success": False,
+                            "provider": "github",
+                            "message": "Falha ao avaliar capability operacional solicitada.",
+                        }
+
+                llm_task = None
+                if not (execution_result and execution_result.get("handled")):
+                    llm_task = asyncio.create_task(
+                        asyncio.to_thread(
+                            _openai_answer,
+                            user_msg if blocked_reply is None else blocked_reply,
+                            citations,
+                            history_dicts,
+                            system_prompt,
+                            model_override,
+                            temperature,
+                        )
                     )
-                )
 
                 last_keepalive = time.monotonic()
                 started_monotonic = time.monotonic()
@@ -7200,7 +7437,7 @@ async def chat_stream(
                     max_stream_seconds = float(os.getenv("MAX_STREAM_SECONDS", "0") or "0")
                 except Exception:
                     max_stream_seconds = 0.0
-                while not llm_task.done():
+                while llm_task is not None and not llm_task.done():
                     if max_stream_seconds and (time.monotonic() - started_monotonic) > max_stream_seconds:
                         # Emit timeout + done, cancel task and end generator without awaiting llm_task.
                         try:
@@ -7228,7 +7465,10 @@ async def chat_stream(
                             return
                     await asyncio.sleep(LLM_WAIT_POLL)
 
-                ans_obj = {"text": blocked_reply, "usage": None, "model": "summit_guard"} if blocked_reply is not None else await llm_task
+                if execution_result and execution_result.get("handled"):
+                    ans_obj = {"text": _build_execution_result_payload(execution_result), "usage": None, "model": "github_capability"}
+                else:
+                    ans_obj = {"text": blocked_reply, "usage": None, "model": "summit_guard"} if blocked_reply is not None else await llm_task
                 if await request.is_disconnected():
                     return
 
@@ -7265,7 +7505,7 @@ async def chat_stream(
                         return
                     continue
 
-                ans = _apply_truthful_execution_mode((ans_obj.get("text") or "").strip(), execution_result=None)
+                ans = _apply_truthful_execution_mode((ans_obj.get("text") or "").strip(), execution_result=execution_result)
 
                 # Persist assistant message (DB path can fail; must rollback)
                 try:
@@ -7411,6 +7651,7 @@ async def chat_stream(
                 if isinstance(_runtime_hints_out, dict):
                     _runtime_hints_out["execution_review"] = execution_review
                     _runtime_hints_out["planner_adjustment"] = planner_adjustment
+                    _runtime_hints_out["capabilities"] = _get_runtime_capability_registry()
                     final_runtime_enrichment["runtime_hints"] = _runtime_hints_out
             except Exception:
                 pass
@@ -10723,42 +10964,3 @@ def admin_update_user_tier(user_id: str, tier: str = "summit_standard", admin=De
     db.add(u)
     db.commit()
     return {"ok": True, "id": u.id, "usage_tier": tier}
-
-
-
-# =========================
-# PATCH v11b SAFE LAYER
-# execution_events bootstrap + capability registry stub
-# =========================
-
-def _ensure_execution_events_schema_runtime(db):
-    try:
-        db.execute("SELECT 1 FROM execution_events LIMIT 1;")
-    except Exception:
-        try:
-            db.execute("""
-            CREATE TABLE IF NOT EXISTS execution_events (
-                id SERIAL PRIMARY KEY,
-                event_type TEXT,
-                agent TEXT,
-                status TEXT,
-                metadata TEXT,
-                created_at TIMESTAMP DEFAULT NOW()
-            );
-            """)
-            db.commit()
-        except Exception:
-            pass
-
-
-def _get_runtime_capability_registry():
-    return {
-        "github_write_file_stub": {
-            "enabled": False,
-            "description": "Stub capability for GitHub file write"
-        },
-        "github_create_branch_stub": {
-            "enabled": False,
-            "description": "Stub capability for GitHub branch creation"
-        }
-    }
