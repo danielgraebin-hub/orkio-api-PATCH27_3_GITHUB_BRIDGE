@@ -1,235 +1,720 @@
 from __future__ import annotations
-
 import os
-from typing import Any, Dict, List, Optional
-
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
-from sqlalchemy import text
-
-from app.db import SessionLocal
-
-router = APIRouter(prefix="/api/internal/db", tags=["db-internal"])
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker, DeclarativeBase
 
 
-def _env(name: str, default: str = "") -> str:
-    return (os.getenv(name, default) or "").strip().strip('"').strip("'")
+def _db_url() -> str:
+    url = (
+        os.getenv("DATABASE_PUBLIC_URL", "").strip().strip('"').strip("'")
+        or os.getenv("DATABASE_URL_PUBLIC", "").strip().strip('"').strip("'")
+        or os.getenv("DATABASE_URL", "").strip().strip('"').strip("'")
+    )
+    url = url.replace("Postgres.railway.internal", "postgres.railway.internal")
+    if not url:
+        return ""
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+    return url
 
 
-def _env_flag(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+class Base(DeclarativeBase):
+    pass
 
 
-def _runtime_enabled() -> bool:
-    return _env_flag("DB_RUNTIME_ENABLED", False)
+def make_engine():
+    url = _db_url()
+    if not url:
+        return None
+    pool_size = int(os.getenv("DB_POOL_SIZE", "5"))
+    max_overflow = int(os.getenv("DB_MAX_OVERFLOW", "10"))
+    pool_timeout = int(os.getenv("DB_POOL_TIMEOUT", "30"))
+    connect_timeout = int(os.getenv("DB_CONNECT_TIMEOUT", "5"))
+    return create_engine(
+        url,
+        pool_pre_ping=True,
+        pool_size=pool_size,
+        max_overflow=max_overflow,
+        pool_timeout=pool_timeout,
+        connect_args={"connect_timeout": connect_timeout},
+    )
 
 
-def _require_approval() -> bool:
-    return _env_flag("REQUIRE_EXPLICIT_DB_APPROVAL", True)
+ENGINE = make_engine()
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=ENGINE) if ENGINE else None
 
 
-def _allowed_tables() -> List[str]:
-    raw = _env("DB_RUNTIME_ALLOWED_TABLES", "cost_events")
-    return [x.strip() for x in raw.split(",") if x.strip()]
+def _reconcile_core_auth_schema_boot():
+    if ENGINE is None:
+        return
 
-
-def _check_enabled() -> None:
-    if not _runtime_enabled():
-        raise HTTPException(status_code=403, detail="DB runtime disabled")
-
-
-SAFE_SCHEMAS: Dict[str, Dict[str, Dict[str, Optional[str]]]] = {
-    "cost_events": {
-        "id": {"type": "VARCHAR", "default": None},
-        "org_slug": {"type": "VARCHAR", "default": None},
-        "user_id": {"type": "VARCHAR", "default": None},
-        "thread_id": {"type": "VARCHAR", "default": None},
-        "message_id": {"type": "VARCHAR", "default": None},
-        "agent_id": {"type": "VARCHAR", "default": None},
-        "provider": {"type": "VARCHAR", "default": None},
-        "model": {"type": "VARCHAR", "default": None},
-        "prompt_tokens": {"type": "INTEGER", "default": "0"},
-        "completion_tokens": {"type": "INTEGER", "default": "0"},
-        "total_tokens": {"type": "INTEGER", "default": "0"},
-        "cost_usd": {"type": "NUMERIC(12,6)", "default": "0"},
-        "usage_missing": {"type": "BOOLEAN", "default": "FALSE"},
-        "metadata": {"type": "TEXT", "default": None},
-        "created_at": {"type": "BIGINT", "default": None},
-        "input_cost_usd": {"type": "NUMERIC(12,6)", "default": "0"},
-        "output_cost_usd": {"type": "NUMERIC(12,6)", "default": "0"},
-        "total_cost_usd": {"type": "NUMERIC(12,6)", "default": "0"},
-        "pricing_version": {"type": "VARCHAR", "default": "'2026-02-18'"},
-        "pricing_snapshot": {"type": "TEXT", "default": None},
-    }
-}
-
-
-class DbSchemaFixIn(BaseModel):
-    table: str = Field(min_length=1, max_length=120)
-    approval: Optional[str] = None
-
-
-def _normalize_table_name(name: str) -> str:
-    return (name or "").strip().lower()
-
-
-def _assert_table_allowed(table: str) -> str:
-    table_name = _normalize_table_name(table)
-    if table_name not in _allowed_tables():
-        raise HTTPException(status_code=403, detail=f"Table not allowed for DB runtime: {table_name}")
-    if table_name not in SAFE_SCHEMAS:
-        raise HTTPException(status_code=400, detail=f"No safe schema registered for table: {table_name}")
-    return table_name
-
-
-def _table_exists(db, table: str) -> bool:
-    row = db.execute(
-        text("""
-            SELECT EXISTS (
-                SELECT 1
-                FROM information_schema.tables
-                WHERE table_schema = 'public' AND table_name = :table_name
-            ) AS exists_flag
-        """),
-        {"table_name": table},
-    ).first()
-    return bool(row[0]) if row else False
-
-
-def _existing_columns(db, table: str) -> Dict[str, Dict[str, Any]]:
-    rows = db.execute(
-        text("""
-            SELECT column_name, data_type, is_nullable, column_default
-            FROM information_schema.columns
-            WHERE table_schema = 'public' AND table_name = :table_name
-            ORDER BY ordinal_position
-        """),
-        {"table_name": table},
-    ).all()
-    out: Dict[str, Dict[str, Any]] = {}
-    for row in rows:
-        out[str(row[0])] = {
-            "data_type": row[1],
-            "is_nullable": row[2],
-            "column_default": row[3],
-        }
-    return out
-
-
-def _create_table_sql(table: str) -> str:
-    schema = SAFE_SCHEMAS[table]
-    lines: List[str] = []
-    for column_name, spec in schema.items():
-        col = f"{column_name} {spec['type']}"
-        if column_name == "id":
-            col += " PRIMARY KEY"
-        if spec.get("default") is not None:
-            col += f" DEFAULT {spec['default']}"
-        lines.append(col)
-    inner = ",\n    ".join(lines)
-    return f"CREATE TABLE IF NOT EXISTS {table} (\n    {inner}\n)"
-
-
-def _missing_column_sql(table: str, column_name: str) -> str:
-    spec = SAFE_SCHEMAS[table][column_name]
-    stmt = f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column_name} {spec['type']}"
-    if spec.get("default") is not None:
-        stmt += f" DEFAULT {spec['default']}"
-    return stmt
-
-
-def build_schema_plan(table: str, db=None) -> Dict[str, Any]:
-    table_name = _assert_table_allowed(table)
-    close_db = False
-    if db is None:
-        db = SessionLocal()
-        close_db = True
     try:
-        exists = _table_exists(db, table_name)
-        expected = SAFE_SCHEMAS[table_name]
-        existing = _existing_columns(db, table_name) if exists else {}
-        missing_columns = [col for col in expected.keys() if col not in existing]
-        statements: List[str] = []
-        if not exists:
-            statements.append(_create_table_sql(table_name))
-        for col in missing_columns:
-            if exists:
-                statements.append(_missing_column_sql(table_name, col))
-        return {
-            "ok": True,
-            "table": table_name,
-            "exists": exists,
-            "missing_columns": missing_columns,
-            "existing_columns": list(existing.keys()),
-            "expected_columns": list(expected.keys()),
-            "statements": statements,
-            "needs_fix": (not exists) or bool(missing_columns),
-        }
-    finally:
-        if close_db:
-            db.close()
+        with ENGINE.begin() as conn:
+            conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS users (
+                id VARCHAR PRIMARY KEY,
+                org_slug VARCHAR,
+                email VARCHAR UNIQUE NOT NULL,
+                name VARCHAR,
+                role VARCHAR DEFAULT 'user',
+                salt VARCHAR,
+                pw_hash VARCHAR,
+                created_at BIGINT,
+                approved_at BIGINT,
+                signup_code_label VARCHAR,
+                signup_source VARCHAR,
+                usage_tier VARCHAR,
+                terms_accepted_at BIGINT,
+                terms_version VARCHAR,
+                marketing_consent BOOLEAN DEFAULT FALSE,
+                company VARCHAR,
+                profile_role VARCHAR,
+                user_type VARCHAR,
+                intent VARCHAR,
+                notes TEXT,
+                country VARCHAR,
+                language VARCHAR,
+                whatsapp VARCHAR,
+                onboarding_completed BOOLEAN DEFAULT FALSE,
+                full_name VARCHAR,
+                password_hash VARCHAR,
+                is_active BOOLEAN DEFAULT TRUE
+            )
+            """))
+
+            stmts = [
+                "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS org_slug VARCHAR",
+                "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS email VARCHAR",
+                "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS name VARCHAR",
+                "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS role VARCHAR DEFAULT 'user'",
+                "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS salt VARCHAR",
+                "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS pw_hash VARCHAR",
+                "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS created_at BIGINT",
+                "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS approved_at BIGINT",
+                "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS signup_code_label VARCHAR",
+                "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS signup_source VARCHAR",
+                "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS usage_tier VARCHAR",
+                "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS terms_accepted_at BIGINT",
+                "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS terms_version VARCHAR",
+                "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS marketing_consent BOOLEAN DEFAULT FALSE",
+                "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS company VARCHAR",
+                "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS profile_role VARCHAR",
+                "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS user_type VARCHAR",
+                "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS intent VARCHAR",
+                "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS notes TEXT",
+                "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS country VARCHAR",
+                "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS language VARCHAR",
+                "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS whatsapp VARCHAR",
+                "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS onboarding_completed BOOLEAN DEFAULT FALSE",
+                "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS full_name VARCHAR",
+                "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS password_hash VARCHAR",
+                "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE",
+                "CREATE INDEX IF NOT EXISTS ix_users_org_slug ON users(org_slug)",
+                "CREATE INDEX IF NOT EXISTS ix_users_email ON users(email)",
+                "CREATE INDEX IF NOT EXISTS ix_users_role ON users(role)",
+                "CREATE INDEX IF NOT EXISTS ix_users_created_at ON users(created_at)",
+                "CREATE INDEX IF NOT EXISTS ix_users_org_email ON users(org_slug, email)",
+            ]
+            for stmt in stmts:
+                conn.execute(text(stmt))
+
+            conn.execute(text("""
+            UPDATE users SET pw_hash = password_hash
+            WHERE pw_hash IS NULL AND password_hash IS NOT NULL
+            """))
+            conn.execute(text("""
+            UPDATE users SET password_hash = pw_hash
+            WHERE password_hash IS NULL AND pw_hash IS NOT NULL
+            """))
+            conn.execute(text("""
+            UPDATE users SET full_name = name
+            WHERE full_name IS NULL AND name IS NOT NULL
+            """))
+            conn.execute(text("""
+            UPDATE users SET name = full_name
+            WHERE name IS NULL AND full_name IS NOT NULL
+            """))
+            conn.execute(text("UPDATE users SET role = 'user' WHERE role IS NULL"))
+            conn.execute(text("UPDATE users SET is_active = TRUE WHERE is_active IS NULL"))
+            conn.execute(text("UPDATE users SET onboarding_completed = FALSE WHERE onboarding_completed IS NULL"))
+            conn.execute(text("UPDATE users SET marketing_consent = FALSE WHERE marketing_consent IS NULL"))
+
+            conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS otp_codes (
+                id VARCHAR PRIMARY KEY,
+                user_id VARCHAR,
+                code_hash VARCHAR NOT NULL,
+                expires_at BIGINT,
+                attempts INTEGER DEFAULT 0,
+                verified BOOLEAN DEFAULT FALSE,
+                created_at BIGINT
+            )
+            """))
+
+            stmts = [
+                "ALTER TABLE IF EXISTS otp_codes ADD COLUMN IF NOT EXISTS user_id VARCHAR",
+                "ALTER TABLE IF EXISTS otp_codes ADD COLUMN IF NOT EXISTS code_hash VARCHAR",
+                "ALTER TABLE IF EXISTS otp_codes ADD COLUMN IF NOT EXISTS expires_at BIGINT",
+                "ALTER TABLE IF EXISTS otp_codes ADD COLUMN IF NOT EXISTS attempts INTEGER DEFAULT 0",
+                "ALTER TABLE IF EXISTS otp_codes ADD COLUMN IF NOT EXISTS verified BOOLEAN DEFAULT FALSE",
+                "ALTER TABLE IF EXISTS otp_codes ADD COLUMN IF NOT EXISTS created_at BIGINT",
+                "ALTER TABLE IF EXISTS otp_codes ADD COLUMN IF NOT EXISTS email VARCHAR",
+                "ALTER TABLE IF EXISTS otp_codes ADD COLUMN IF NOT EXISTS used BOOLEAN DEFAULT FALSE",
+                "CREATE INDEX IF NOT EXISTS ix_otp_codes_user_id ON otp_codes(user_id)",
+                "CREATE INDEX IF NOT EXISTS ix_otp_codes_email ON otp_codes(email)",
+            ]
+            for stmt in stmts:
+                conn.execute(text(stmt))
+
+            conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS user_sessions (
+                id VARCHAR PRIMARY KEY,
+                user_id VARCHAR,
+                org_slug VARCHAR,
+                login_at BIGINT,
+                logout_at BIGINT,
+                last_seen_at BIGINT,
+                ended_reason VARCHAR,
+                duration_seconds INTEGER,
+                source_code_label VARCHAR,
+                usage_tier VARCHAR,
+                ip_address VARCHAR
+            )
+            """))
+
+            stmts = [
+                "ALTER TABLE IF EXISTS user_sessions ADD COLUMN IF NOT EXISTS user_id VARCHAR",
+                "ALTER TABLE IF EXISTS user_sessions ADD COLUMN IF NOT EXISTS org_slug VARCHAR",
+                "ALTER TABLE IF EXISTS user_sessions ADD COLUMN IF NOT EXISTS login_at BIGINT",
+                "ALTER TABLE IF EXISTS user_sessions ADD COLUMN IF NOT EXISTS logout_at BIGINT",
+                "ALTER TABLE IF EXISTS user_sessions ADD COLUMN IF NOT EXISTS last_seen_at BIGINT",
+                "ALTER TABLE IF EXISTS user_sessions ADD COLUMN IF NOT EXISTS ended_reason VARCHAR",
+                "ALTER TABLE IF EXISTS user_sessions ADD COLUMN IF NOT EXISTS duration_seconds INTEGER",
+                "ALTER TABLE IF EXISTS user_sessions ADD COLUMN IF NOT EXISTS source_code_label VARCHAR",
+                "ALTER TABLE IF EXISTS user_sessions ADD COLUMN IF NOT EXISTS usage_tier VARCHAR",
+                "ALTER TABLE IF EXISTS user_sessions ADD COLUMN IF NOT EXISTS ip_address VARCHAR",
+                "ALTER TABLE IF EXISTS user_sessions ADD COLUMN IF NOT EXISTS session_token VARCHAR",
+                "ALTER TABLE IF EXISTS user_sessions ADD COLUMN IF NOT EXISTS expires_at BIGINT",
+                "ALTER TABLE IF EXISTS user_sessions ADD COLUMN IF NOT EXISTS created_at BIGINT",
+                "CREATE INDEX IF NOT EXISTS ix_user_sessions_user_id ON user_sessions(user_id)",
+                "CREATE INDEX IF NOT EXISTS ix_user_sessions_org_slug ON user_sessions(org_slug)",
+            ]
+            for stmt in stmts:
+                conn.execute(text(stmt))
+
+            conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS terms_acceptances (
+                id VARCHAR PRIMARY KEY,
+                user_id VARCHAR NOT NULL,
+                terms_version VARCHAR NOT NULL,
+                accepted_at BIGINT NOT NULL,
+                ip_address VARCHAR,
+                user_agent VARCHAR
+            )
+            """))
+
+            stmts = [
+                "ALTER TABLE IF EXISTS terms_acceptances ADD COLUMN IF NOT EXISTS user_id VARCHAR",
+                "ALTER TABLE IF EXISTS terms_acceptances ADD COLUMN IF NOT EXISTS terms_version VARCHAR",
+                "ALTER TABLE IF EXISTS terms_acceptances ADD COLUMN IF NOT EXISTS accepted_at BIGINT",
+                "ALTER TABLE IF EXISTS terms_acceptances ADD COLUMN IF NOT EXISTS ip_address VARCHAR",
+                "ALTER TABLE IF EXISTS terms_acceptances ADD COLUMN IF NOT EXISTS user_agent VARCHAR",
+                "CREATE INDEX IF NOT EXISTS ix_terms_acceptances_user_id ON terms_acceptances(user_id)",
+            ]
+            for stmt in stmts:
+                conn.execute(text(stmt))
+
+            conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS marketing_consents (
+                id VARCHAR PRIMARY KEY,
+                user_id VARCHAR,
+                contact_id VARCHAR,
+                channel VARCHAR NOT NULL,
+                opt_in_date BIGINT,
+                opt_out_date BIGINT,
+                ip VARCHAR,
+                source VARCHAR,
+                created_at BIGINT NOT NULL
+            )
+            """))
+
+            stmts = [
+                "ALTER TABLE IF EXISTS marketing_consents ADD COLUMN IF NOT EXISTS user_id VARCHAR",
+                "ALTER TABLE IF EXISTS marketing_consents ADD COLUMN IF NOT EXISTS contact_id VARCHAR",
+                "ALTER TABLE IF EXISTS marketing_consents ADD COLUMN IF NOT EXISTS channel VARCHAR",
+                "ALTER TABLE IF EXISTS marketing_consents ADD COLUMN IF NOT EXISTS opt_in_date BIGINT",
+                "ALTER TABLE IF EXISTS marketing_consents ADD COLUMN IF NOT EXISTS opt_out_date BIGINT",
+                "ALTER TABLE IF EXISTS marketing_consents ADD COLUMN IF NOT EXISTS ip VARCHAR",
+                "ALTER TABLE IF EXISTS marketing_consents ADD COLUMN IF NOT EXISTS source VARCHAR",
+                "ALTER TABLE IF EXISTS marketing_consents ADD COLUMN IF NOT EXISTS created_at BIGINT",
+                "CREATE INDEX IF NOT EXISTS ix_marketing_consents_user_id ON marketing_consents(user_id)",
+            ]
+            for stmt in stmts:
+                conn.execute(text(stmt))
+
+            conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS threads (
+                id VARCHAR PRIMARY KEY,
+                org_slug VARCHAR,
+                title VARCHAR,
+                created_at BIGINT
+            )
+            """))
+
+            stmts = [
+                "ALTER TABLE IF EXISTS threads ADD COLUMN IF NOT EXISTS org_slug VARCHAR",
+                "ALTER TABLE IF EXISTS threads ADD COLUMN IF NOT EXISTS title VARCHAR",
+                "ALTER TABLE IF EXISTS threads ADD COLUMN IF NOT EXISTS created_at BIGINT",
+                "ALTER TABLE IF EXISTS threads ADD COLUMN IF NOT EXISTS created_by VARCHAR",
+                "CREATE INDEX IF NOT EXISTS ix_threads_org_slug ON threads(org_slug)",
+            ]
+            for stmt in stmts:
+                conn.execute(text(stmt))
+
+            conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id VARCHAR PRIMARY KEY,
+                org_slug VARCHAR,
+                thread_id VARCHAR,
+                user_id VARCHAR,
+                user_name VARCHAR,
+                role VARCHAR,
+                content TEXT,
+                agent_id VARCHAR,
+                agent_name VARCHAR,
+                client_message_id VARCHAR,
+                created_at BIGINT
+            )
+            """))
+
+            stmts = [
+                "ALTER TABLE IF EXISTS messages ADD COLUMN IF NOT EXISTS org_slug VARCHAR",
+                "ALTER TABLE IF EXISTS messages ADD COLUMN IF NOT EXISTS thread_id VARCHAR",
+                "ALTER TABLE IF EXISTS messages ADD COLUMN IF NOT EXISTS user_id VARCHAR",
+                "ALTER TABLE IF EXISTS messages ADD COLUMN IF NOT EXISTS user_name VARCHAR",
+                "ALTER TABLE IF EXISTS messages ADD COLUMN IF NOT EXISTS role VARCHAR",
+                "ALTER TABLE IF EXISTS messages ADD COLUMN IF NOT EXISTS content TEXT",
+                "ALTER TABLE IF EXISTS messages ADD COLUMN IF NOT EXISTS agent_id VARCHAR",
+                "ALTER TABLE IF EXISTS messages ADD COLUMN IF NOT EXISTS agent_name VARCHAR",
+                "ALTER TABLE IF EXISTS messages ADD COLUMN IF NOT EXISTS client_message_id VARCHAR",
+                "ALTER TABLE IF EXISTS messages ADD COLUMN IF NOT EXISTS created_at BIGINT",
+                "CREATE INDEX IF NOT EXISTS ix_messages_thread_id ON messages(thread_id)",
+                "CREATE INDEX IF NOT EXISTS ix_messages_org_thread ON messages(org_slug, thread_id)",
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_messages_org_thread_client_msg ON messages(org_slug, thread_id, client_message_id)",
+            ]
+            for stmt in stmts:
+                conn.execute(text(stmt))
+
+        print("CORE_AUTH_SCHEMA_BOOT_OK")
+    except Exception as e:
+        print("CORE_AUTH_SCHEMA_BOOT_FAILED", str(e))
 
 
-def apply_schema_plan(table: str) -> Dict[str, Any]:
-    table_name = _assert_table_allowed(table)
+def _reconcile_agents_schema_boot():
+    if ENGINE is None:
+        return
+
+    try:
+        with ENGINE.begin() as conn:
+            conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS agents (
+                id VARCHAR PRIMARY KEY,
+                org_slug VARCHAR NOT NULL,
+                name VARCHAR NOT NULL,
+                description TEXT,
+                system_prompt TEXT NOT NULL DEFAULT '',
+                model VARCHAR,
+                embedding_model VARCHAR,
+                temperature VARCHAR,
+                rag_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                rag_top_k INTEGER NOT NULL DEFAULT 6,
+                is_default BOOLEAN NOT NULL DEFAULT FALSE,
+                voice_id VARCHAR DEFAULT 'nova',
+                avatar_url VARCHAR,
+                created_at BIGINT NOT NULL,
+                updated_at BIGINT NOT NULL
+            )
+            """))
+
+            stmts = [
+                "ALTER TABLE IF EXISTS agents ADD COLUMN IF NOT EXISTS org_slug VARCHAR",
+                "ALTER TABLE IF EXISTS agents ADD COLUMN IF NOT EXISTS name VARCHAR",
+                "ALTER TABLE IF EXISTS agents ADD COLUMN IF NOT EXISTS description TEXT",
+                "ALTER TABLE IF EXISTS agents ADD COLUMN IF NOT EXISTS system_prompt TEXT DEFAULT ''",
+                "ALTER TABLE IF EXISTS agents ADD COLUMN IF NOT EXISTS model VARCHAR",
+                "ALTER TABLE IF EXISTS agents ADD COLUMN IF NOT EXISTS embedding_model VARCHAR",
+                "ALTER TABLE IF EXISTS agents ADD COLUMN IF NOT EXISTS temperature VARCHAR",
+                "ALTER TABLE IF EXISTS agents ADD COLUMN IF NOT EXISTS rag_enabled BOOLEAN NOT NULL DEFAULT TRUE",
+                "ALTER TABLE IF EXISTS agents ADD COLUMN IF NOT EXISTS rag_top_k INTEGER NOT NULL DEFAULT 6",
+                "ALTER TABLE IF EXISTS agents ADD COLUMN IF NOT EXISTS is_default BOOLEAN NOT NULL DEFAULT FALSE",
+                "ALTER TABLE IF EXISTS agents ADD COLUMN IF NOT EXISTS voice_id VARCHAR DEFAULT 'nova'",
+                "ALTER TABLE IF EXISTS agents ADD COLUMN IF NOT EXISTS avatar_url VARCHAR",
+                "ALTER TABLE IF EXISTS agents ADD COLUMN IF NOT EXISTS created_at BIGINT",
+                "ALTER TABLE IF EXISTS agents ADD COLUMN IF NOT EXISTS updated_at BIGINT",
+                "CREATE INDEX IF NOT EXISTS ix_agents_org_slug ON agents(org_slug)",
+                "CREATE INDEX IF NOT EXISTS ix_agents_updated_at ON agents(updated_at)",
+            ]
+            for stmt in stmts:
+                conn.execute(text(stmt))
+
+            conn.execute(text("UPDATE agents SET system_prompt = '' WHERE system_prompt IS NULL"))
+            conn.execute(text("UPDATE agents SET rag_enabled = TRUE WHERE rag_enabled IS NULL"))
+            conn.execute(text("UPDATE agents SET rag_top_k = 6 WHERE rag_top_k IS NULL"))
+            conn.execute(text("UPDATE agents SET is_default = FALSE WHERE is_default IS NULL"))
+            conn.execute(text("UPDATE agents SET voice_id = 'nova' WHERE voice_id IS NULL"))
+            conn.execute(text("UPDATE agents SET updated_at = created_at WHERE updated_at IS NULL AND created_at IS NOT NULL"))
+
+            conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS agent_knowledge (
+                id VARCHAR PRIMARY KEY,
+                org_slug VARCHAR NOT NULL,
+                agent_id VARCHAR NOT NULL,
+                file_id VARCHAR NOT NULL,
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at BIGINT NOT NULL
+            )
+            """))
+
+            stmts = [
+                "ALTER TABLE IF EXISTS agent_knowledge ADD COLUMN IF NOT EXISTS org_slug VARCHAR",
+                "ALTER TABLE IF EXISTS agent_knowledge ADD COLUMN IF NOT EXISTS agent_id VARCHAR",
+                "ALTER TABLE IF EXISTS agent_knowledge ADD COLUMN IF NOT EXISTS file_id VARCHAR",
+                "ALTER TABLE IF EXISTS agent_knowledge ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT TRUE",
+                "ALTER TABLE IF EXISTS agent_knowledge ADD COLUMN IF NOT EXISTS created_at BIGINT",
+                "CREATE INDEX IF NOT EXISTS ix_agent_knowledge_org_slug ON agent_knowledge(org_slug)",
+                "CREATE INDEX IF NOT EXISTS ix_agent_knowledge_agent_id ON agent_knowledge(agent_id)",
+                "CREATE INDEX IF NOT EXISTS ix_agent_knowledge_file_id ON agent_knowledge(file_id)",
+            ]
+            for stmt in stmts:
+                conn.execute(text(stmt))
+
+            conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS agent_links (
+                id VARCHAR PRIMARY KEY,
+                org_slug VARCHAR NOT NULL,
+                source_agent_id VARCHAR NOT NULL,
+                target_agent_id VARCHAR NOT NULL,
+                mode VARCHAR NOT NULL DEFAULT 'consult',
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at BIGINT NOT NULL
+            )
+            """))
+
+            stmts = [
+                "ALTER TABLE IF EXISTS agent_links ADD COLUMN IF NOT EXISTS org_slug VARCHAR",
+                "ALTER TABLE IF EXISTS agent_links ADD COLUMN IF NOT EXISTS source_agent_id VARCHAR",
+                "ALTER TABLE IF EXISTS agent_links ADD COLUMN IF NOT EXISTS target_agent_id VARCHAR",
+                "ALTER TABLE IF EXISTS agent_links ADD COLUMN IF NOT EXISTS mode VARCHAR NOT NULL DEFAULT 'consult'",
+                "ALTER TABLE IF EXISTS agent_links ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT TRUE",
+                "ALTER TABLE IF EXISTS agent_links ADD COLUMN IF NOT EXISTS created_at BIGINT",
+                "CREATE INDEX IF NOT EXISTS ix_agent_links_org_slug ON agent_links(org_slug)",
+                "CREATE INDEX IF NOT EXISTS ix_agent_links_source_agent_id ON agent_links(source_agent_id)",
+                "CREATE INDEX IF NOT EXISTS ix_agent_links_target_agent_id ON agent_links(target_agent_id)",
+            ]
+            for stmt in stmts:
+                conn.execute(text(stmt))
+
+        print("AGENTS_SCHEMA_RECONCILE_DB_BOOT_OK")
+    except Exception as e:
+        print("AGENTS_SCHEMA_RECONCILE_DB_BOOT_FAILED", str(e))
+
+
+def _reconcile_collab_and_realtime_schema_boot():
+    if ENGINE is None:
+        return
+
+    try:
+        with ENGINE.begin() as conn:
+            conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS thread_members (
+                id VARCHAR PRIMARY KEY,
+                org_slug VARCHAR NOT NULL,
+                thread_id VARCHAR NOT NULL,
+                user_id VARCHAR NOT NULL,
+                role VARCHAR NOT NULL,
+                created_at BIGINT NOT NULL
+            )
+            """))
+
+            stmts = [
+                "ALTER TABLE IF EXISTS thread_members ADD COLUMN IF NOT EXISTS org_slug VARCHAR",
+                "ALTER TABLE IF EXISTS thread_members ADD COLUMN IF NOT EXISTS thread_id VARCHAR",
+                "ALTER TABLE IF EXISTS thread_members ADD COLUMN IF NOT EXISTS user_id VARCHAR",
+                "ALTER TABLE IF EXISTS thread_members ADD COLUMN IF NOT EXISTS role VARCHAR",
+                "ALTER TABLE IF EXISTS thread_members ADD COLUMN IF NOT EXISTS created_at BIGINT",
+                "CREATE INDEX IF NOT EXISTS ix_thread_members_org_slug ON thread_members(org_slug)",
+                "CREATE INDEX IF NOT EXISTS ix_thread_members_thread_id ON thread_members(thread_id)",
+                "CREATE INDEX IF NOT EXISTS ix_thread_members_user_id ON thread_members(user_id)",
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_thread_members_thread_user ON thread_members(thread_id, user_id)",
+            ]
+            for stmt in stmts:
+                conn.execute(text(stmt))
+
+            conn.execute(text("""
+            UPDATE thread_members SET role = 'member'
+            WHERE role IS NULL OR role = ''
+            """))
+
+            conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS realtime_sessions (
+                id VARCHAR PRIMARY KEY,
+                org_slug VARCHAR NOT NULL,
+                thread_id VARCHAR NOT NULL,
+                agent_id VARCHAR,
+                agent_name VARCHAR,
+                user_id VARCHAR,
+                user_name VARCHAR,
+                model VARCHAR,
+                voice VARCHAR,
+                started_at BIGINT NOT NULL,
+                ended_at BIGINT,
+                meta TEXT
+            )
+            """))
+
+            stmts = [
+                "ALTER TABLE IF EXISTS realtime_sessions ADD COLUMN IF NOT EXISTS org_slug VARCHAR",
+                "ALTER TABLE IF EXISTS realtime_sessions ADD COLUMN IF NOT EXISTS thread_id VARCHAR",
+                "ALTER TABLE IF EXISTS realtime_sessions ADD COLUMN IF NOT EXISTS agent_id VARCHAR",
+                "ALTER TABLE IF EXISTS realtime_sessions ADD COLUMN IF NOT EXISTS agent_name VARCHAR",
+                "ALTER TABLE IF EXISTS realtime_sessions ADD COLUMN IF NOT EXISTS user_id VARCHAR",
+                "ALTER TABLE IF EXISTS realtime_sessions ADD COLUMN IF NOT EXISTS user_name VARCHAR",
+                "ALTER TABLE IF EXISTS realtime_sessions ADD COLUMN IF NOT EXISTS model VARCHAR",
+                "ALTER TABLE IF EXISTS realtime_sessions ADD COLUMN IF NOT EXISTS voice VARCHAR",
+                "ALTER TABLE IF EXISTS realtime_sessions ADD COLUMN IF NOT EXISTS started_at BIGINT",
+                "ALTER TABLE IF EXISTS realtime_sessions ADD COLUMN IF NOT EXISTS ended_at BIGINT",
+                "ALTER TABLE IF EXISTS realtime_sessions ADD COLUMN IF NOT EXISTS meta TEXT",
+                "CREATE INDEX IF NOT EXISTS ix_realtime_sessions_org_slug ON realtime_sessions(org_slug)",
+                "CREATE INDEX IF NOT EXISTS ix_realtime_sessions_thread_id ON realtime_sessions(thread_id)",
+            ]
+            for stmt in stmts:
+                conn.execute(text(stmt))
+
+            conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS realtime_events (
+                id VARCHAR PRIMARY KEY,
+                org_slug VARCHAR NOT NULL,
+                session_id VARCHAR NOT NULL,
+                thread_id VARCHAR NOT NULL,
+                speaker_type VARCHAR NOT NULL,
+                speaker_id VARCHAR,
+                agent_id VARCHAR,
+                agent_name VARCHAR,
+                event_type VARCHAR NOT NULL,
+                transcript_raw TEXT,
+                transcript_punct TEXT,
+                created_at BIGINT NOT NULL,
+                client_event_id VARCHAR,
+                meta TEXT
+            )
+            """))
+
+            stmts = [
+                "ALTER TABLE IF EXISTS realtime_events ADD COLUMN IF NOT EXISTS org_slug VARCHAR",
+                "ALTER TABLE IF EXISTS realtime_events ADD COLUMN IF NOT EXISTS session_id VARCHAR",
+                "ALTER TABLE IF EXISTS realtime_events ADD COLUMN IF NOT EXISTS thread_id VARCHAR",
+                "ALTER TABLE IF EXISTS realtime_events ADD COLUMN IF NOT EXISTS speaker_type VARCHAR",
+                "ALTER TABLE IF EXISTS realtime_events ADD COLUMN IF NOT EXISTS speaker_id VARCHAR",
+                "ALTER TABLE IF EXISTS realtime_events ADD COLUMN IF NOT EXISTS agent_id VARCHAR",
+                "ALTER TABLE IF EXISTS realtime_events ADD COLUMN IF NOT EXISTS agent_name VARCHAR",
+                "ALTER TABLE IF EXISTS realtime_events ADD COLUMN IF NOT EXISTS event_type VARCHAR",
+                "ALTER TABLE IF EXISTS realtime_events ADD COLUMN IF NOT EXISTS transcript_raw TEXT",
+                "ALTER TABLE IF EXISTS realtime_events ADD COLUMN IF NOT EXISTS transcript_punct TEXT",
+                "ALTER TABLE IF EXISTS realtime_events ADD COLUMN IF NOT EXISTS created_at BIGINT",
+                "ALTER TABLE IF EXISTS realtime_events ADD COLUMN IF NOT EXISTS client_event_id VARCHAR",
+                "ALTER TABLE IF EXISTS realtime_events ADD COLUMN IF NOT EXISTS meta TEXT",
+                "CREATE INDEX IF NOT EXISTS ix_realtime_events_org_slug ON realtime_events(org_slug)",
+                "CREATE INDEX IF NOT EXISTS ix_realtime_events_session_id ON realtime_events(session_id)",
+                "CREATE INDEX IF NOT EXISTS ix_realtime_events_thread_id ON realtime_events(thread_id)",
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_realtime_events_org_sess_client_eid ON realtime_events(org_slug, session_id, client_event_id)",
+            ]
+            for stmt in stmts:
+                conn.execute(text(stmt))
+
+        print("COLLAB_REALTIME_SCHEMA_BOOT_OK")
+    except Exception as e:
+        print("COLLAB_REALTIME_SCHEMA_BOOT_FAILED", str(e))
+
+
+def _reconcile_files_schema_boot():
+    if ENGINE is None:
+        return
+
+    try:
+        with ENGINE.begin() as conn:
+            conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS files (
+                id VARCHAR PRIMARY KEY,
+                org_slug VARCHAR,
+                thread_id VARCHAR,
+                uploader_id VARCHAR,
+                uploader_name VARCHAR,
+                uploader_email VARCHAR,
+                filename VARCHAR,
+                original_filename VARCHAR,
+                origin VARCHAR,
+                scope_thread_id VARCHAR,
+                scope_agent_id VARCHAR,
+                mime_type VARCHAR,
+                size_bytes BIGINT DEFAULT 0,
+                content BYTEA,
+                extraction_failed BOOLEAN DEFAULT FALSE,
+                is_institutional BOOLEAN DEFAULT FALSE,
+                created_at BIGINT,
+                origin_thread_id VARCHAR,
+                name VARCHAR
+            )
+            """))
+
+            conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS signup_codes (
+                id VARCHAR PRIMARY KEY,
+                org_slug VARCHAR NOT NULL,
+                code_hash VARCHAR NOT NULL,
+                label VARCHAR NOT NULL,
+                source VARCHAR NOT NULL,
+                expires_at BIGINT,
+                max_uses INTEGER NOT NULL DEFAULT 500,
+                used_count INTEGER NOT NULL DEFAULT 0,
+                active BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at BIGINT NOT NULL,
+                created_by VARCHAR
+            )
+            """))
+
+            stmts = [
+                "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS thread_id VARCHAR",
+                "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS uploader_id VARCHAR",
+                "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS uploader_name VARCHAR",
+                "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS uploader_email VARCHAR",
+                "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS org_slug VARCHAR",
+                "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS filename VARCHAR",
+                "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS original_filename VARCHAR",
+                "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS origin VARCHAR",
+                "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS scope_thread_id VARCHAR",
+                "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS scope_agent_id VARCHAR",
+                "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS mime_type VARCHAR",
+                "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS size_bytes BIGINT NOT NULL DEFAULT 0",
+                "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS content BYTEA",
+                "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS extraction_failed BOOLEAN NOT NULL DEFAULT FALSE",
+                "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS is_institutional BOOLEAN NOT NULL DEFAULT FALSE",
+                "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS created_at BIGINT",
+                "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS origin_thread_id VARCHAR",
+                "ALTER TABLE IF EXISTS files ADD COLUMN IF NOT EXISTS name VARCHAR",
+                "CREATE INDEX IF NOT EXISTS ix_files_thread_id ON files(thread_id)",
+                "CREATE INDEX IF NOT EXISTS ix_files_scope_thread_id ON files(scope_thread_id)",
+                "CREATE INDEX IF NOT EXISTS ix_files_scope_agent_id ON files(scope_agent_id)",
+                "CREATE INDEX IF NOT EXISTS ix_signup_codes_org ON signup_codes(org_slug)",
+            ]
+            for stmt in stmts:
+                conn.execute(text(stmt))
+
+            conn.execute(text("""
+            UPDATE files SET name = filename
+            WHERE name IS NULL AND filename IS NOT NULL
+            """))
+
+            try:
+                conn.execute(text("ALTER TABLE IF EXISTS files ALTER COLUMN name DROP NOT NULL"))
+            except Exception:
+                pass
+
+            conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS file_texts (
+                id VARCHAR PRIMARY KEY,
+                org_slug VARCHAR NOT NULL,
+                file_id VARCHAR NOT NULL,
+                text TEXT NOT NULL,
+                extracted_chars INTEGER NOT NULL DEFAULT 0,
+                created_at BIGINT NOT NULL
+            )
+            """))
+
+            stmts = [
+                "ALTER TABLE IF EXISTS file_texts ADD COLUMN IF NOT EXISTS org_slug VARCHAR",
+                "ALTER TABLE IF EXISTS file_texts ADD COLUMN IF NOT EXISTS file_id VARCHAR",
+                "ALTER TABLE IF EXISTS file_texts ADD COLUMN IF NOT EXISTS text TEXT",
+                "ALTER TABLE IF EXISTS file_texts ADD COLUMN IF NOT EXISTS extracted_chars INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE IF EXISTS file_texts ADD COLUMN IF NOT EXISTS created_at BIGINT",
+                "CREATE INDEX IF NOT EXISTS ix_file_texts_org_slug ON file_texts(org_slug)",
+                "CREATE INDEX IF NOT EXISTS ix_file_texts_file_id ON file_texts(file_id)",
+            ]
+            for stmt in stmts:
+                conn.execute(text(stmt))
+
+            conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS file_chunks (
+                id VARCHAR PRIMARY KEY,
+                org_slug VARCHAR NOT NULL,
+                file_id VARCHAR NOT NULL,
+                idx INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                agent_id VARCHAR,
+                agent_name VARCHAR,
+                created_at BIGINT NOT NULL
+            )
+            """))
+
+            stmts = [
+                "ALTER TABLE IF EXISTS file_chunks ADD COLUMN IF NOT EXISTS org_slug VARCHAR",
+                "ALTER TABLE IF EXISTS file_chunks ADD COLUMN IF NOT EXISTS file_id VARCHAR",
+                "ALTER TABLE IF EXISTS file_chunks ADD COLUMN IF NOT EXISTS idx INTEGER",
+                "ALTER TABLE IF EXISTS file_chunks ADD COLUMN IF NOT EXISTS content TEXT",
+                "ALTER TABLE IF EXISTS file_chunks ADD COLUMN IF NOT EXISTS agent_id VARCHAR",
+                "ALTER TABLE IF EXISTS file_chunks ADD COLUMN IF NOT EXISTS agent_name VARCHAR",
+                "ALTER TABLE IF EXISTS file_chunks ADD COLUMN IF NOT EXISTS created_at BIGINT",
+                "CREATE INDEX IF NOT EXISTS ix_file_chunks_org_slug ON file_chunks(org_slug)",
+                "CREATE INDEX IF NOT EXISTS ix_file_chunks_file_id ON file_chunks(file_id)",
+            ]
+            for stmt in stmts:
+                conn.execute(text(stmt))
+
+            conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id VARCHAR PRIMARY KEY,
+                org_slug VARCHAR NOT NULL,
+                user_id VARCHAR,
+                action VARCHAR NOT NULL,
+                meta TEXT,
+                request_id VARCHAR,
+                path VARCHAR,
+                status_code INTEGER,
+                latency_ms INTEGER,
+                created_at BIGINT NOT NULL
+            )
+            """))
+
+            stmts = [
+                "ALTER TABLE IF EXISTS audit_logs ADD COLUMN IF NOT EXISTS org_slug VARCHAR",
+                "ALTER TABLE IF EXISTS audit_logs ADD COLUMN IF NOT EXISTS user_id VARCHAR",
+                "ALTER TABLE IF EXISTS audit_logs ADD COLUMN IF NOT EXISTS action VARCHAR",
+                "ALTER TABLE IF EXISTS audit_logs ADD COLUMN IF NOT EXISTS meta TEXT",
+                "ALTER TABLE IF EXISTS audit_logs ADD COLUMN IF NOT EXISTS request_id VARCHAR",
+                "ALTER TABLE IF EXISTS audit_logs ADD COLUMN IF NOT EXISTS path VARCHAR",
+                "ALTER TABLE IF EXISTS audit_logs ADD COLUMN IF NOT EXISTS status_code INTEGER",
+                "ALTER TABLE IF EXISTS audit_logs ADD COLUMN IF NOT EXISTS latency_ms INTEGER",
+                "ALTER TABLE IF EXISTS audit_logs ADD COLUMN IF NOT EXISTS created_at BIGINT",
+                "CREATE INDEX IF NOT EXISTS ix_audit_logs_org_slug ON audit_logs(org_slug)",
+            ]
+            for stmt in stmts:
+                conn.execute(text(stmt))
+
+        print("FILES_SCHEMA_RECONCILE_DB_BOOT_OK")
+    except Exception as e:
+        print("FILES_SCHEMA_RECONCILE_DB_BOOT_FAILED", str(e))
+
+
+_reconcile_core_auth_schema_boot()
+_reconcile_agents_schema_boot()
+_reconcile_collab_and_realtime_schema_boot()
+_reconcile_files_schema_boot()
+
+
+def get_db():
+    if SessionLocal is None:
+        raise RuntimeError("DATABASE_URL not configured")
     db = SessionLocal()
     try:
-        plan = build_schema_plan(table_name, db=db)
-        executed: List[str] = []
-        if not plan["needs_fix"]:
-            return {
-                "ok": True,
-                "table": table_name,
-                "executed": executed,
-                "message": "No drift detected",
-                "validation": build_schema_plan(table_name, db=db),
-            }
-        for stmt in plan["statements"]:
-            db.execute(text(stmt))
-            executed.append(stmt)
-        db.commit()
-        validation = build_schema_plan(table_name, db=db)
-        return {
-            "ok": True,
-            "table": table_name,
-            "executed": executed,
-            "validation": validation,
-        }
-    except Exception as e:
-        try:
-            db.rollback()
-        except Exception:
-            pass
-        raise HTTPException(status_code=500, detail=f"DB runtime fix failed: {e}")
+        yield db
     finally:
         db.close()
-
-
-@router.get("/health")
-def db_runtime_health():
-    return {
-        "ok": True,
-        "service": "db_internal",
-        "runtime_enabled": _runtime_enabled(),
-        "approval_required": _require_approval(),
-        "allowed_tables": _allowed_tables(),
-    }
-
-
-@router.get("/schema/check")
-def db_schema_check(table: str):
-    _check_enabled()
-    return build_schema_plan(table)
-
-
-@router.post("/schema/fix")
-def db_schema_fix(payload: DbSchemaFixIn):
-    _check_enabled()
-    if _require_approval():
-        approval = (payload.approval or "").strip().lower()
-        if approval not in {"de acordo", "aprovado", "autorizado", "pode seguir", "ok executar", "ok, executar", "liberado"}:
-            raise HTTPException(status_code=400, detail="Explicit DB approval required")
-    return apply_schema_plan(payload.table)
