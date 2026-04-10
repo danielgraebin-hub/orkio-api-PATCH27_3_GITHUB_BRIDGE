@@ -19,12 +19,30 @@ CAPABILITY_REGISTRY = {
             "github_branch_create",
             "github_file_create",
             "governed_patch_execution",
+            "db_schema_read",
+            "db_schema_fix_governed",
         ],
-        "triggers": ["github", "repo", "code", "patch", "fix", "technical"],
+        "triggers": [
+            "github",
+            "repo",
+            "code",
+            "patch",
+            "fix",
+            "technical",
+            "database",
+            "banco",
+            "schema",
+            "drift",
+            "migration",
+            "migracao",
+            "tabela",
+            "coluna",
+        ],
         "dependencies": ["orkio"],
         "priority": 98,
         "writes_memory": False,
     },
+
     "miguel": {
         "role": "guardian",
         "capabilities": ["risk_guard", "safety_boundary", "sensitive_review"],
@@ -33,6 +51,7 @@ CAPABILITY_REGISTRY = {
         "priority": 95,
         "writes_memory": False,
     },
+
     "uriel": {
         "role": "diagnostician",
         "capabilities": ["root_cause", "priority_diagnosis", "clarify_decision"],
@@ -41,6 +60,7 @@ CAPABILITY_REGISTRY = {
         "priority": 90,
         "writes_memory": False,
     },
+
     "rafael": {
         "role": "organizer",
         "capabilities": ["reframe", "small_steps", "practical_plan"],
@@ -49,6 +69,7 @@ CAPABILITY_REGISTRY = {
         "priority": 85,
         "writes_memory": False,
     },
+
     "gabriel": {
         "role": "translator",
         "capabilities": ["simplify", "translate_for_user", "clarify_message"],
@@ -57,6 +78,7 @@ CAPABILITY_REGISTRY = {
         "priority": 80,
         "writes_memory": False,
     },
+
     "metatron": {
         "role": "scribe",
         "capabilities": ["candidate_memory", "session_register", "continuity_signal"],
@@ -65,6 +87,7 @@ CAPABILITY_REGISTRY = {
         "priority": 75,
         "writes_memory": True,
     },
+
     "saint_germain": {
         "role": "refiner",
         "capabilities": ["incremental_refinement", "maturity", "process_improvement"],
@@ -75,6 +98,6 @@ CAPABILITY_REGISTRY = {
     },
 }
 
+
 def get_capability_registry():
     return CAPABILITY_REGISTRY.copy()
-
