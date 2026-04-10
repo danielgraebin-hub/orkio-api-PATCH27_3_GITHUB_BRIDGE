@@ -1402,6 +1402,18 @@ def ensure_schema(db: Session):
         """))
         db.execute(text("CREATE INDEX IF NOT EXISTS idx_cost_events_org ON cost_events(org_slug)"))
         db.execute(text("CREATE INDEX IF NOT EXISTS idx_cost_events_created ON cost_events(created_at)"))
+        # Hotfix: reconcile legacy cost_events schemas in-place
+        db.execute(text("ALTER TABLE IF EXISTS cost_events ADD COLUMN IF NOT EXISTS user_id VARCHAR"))
+        db.execute(text("ALTER TABLE IF EXISTS cost_events ADD COLUMN IF NOT EXISTS thread_id VARCHAR"))
+        db.execute(text("ALTER TABLE IF EXISTS cost_events ADD COLUMN IF NOT EXISTS message_id VARCHAR"))
+        db.execute(text("ALTER TABLE IF EXISTS cost_events ADD COLUMN IF NOT EXISTS agent_id VARCHAR"))
+        db.execute(text("ALTER TABLE IF EXISTS cost_events ADD COLUMN IF NOT EXISTS provider VARCHAR"))
+        db.execute(text("ALTER TABLE IF EXISTS cost_events ADD COLUMN IF NOT EXISTS model VARCHAR"))
+        db.execute(text("ALTER TABLE IF EXISTS cost_events ADD COLUMN IF NOT EXISTS prompt_tokens INTEGER NOT NULL DEFAULT 0"))
+        db.execute(text("ALTER TABLE IF EXISTS cost_events ADD COLUMN IF NOT EXISTS completion_tokens INTEGER NOT NULL DEFAULT 0"))
+        db.execute(text("ALTER TABLE IF EXISTS cost_events ADD COLUMN IF NOT EXISTS total_tokens INTEGER NOT NULL DEFAULT 0"))
+        db.execute(text("ALTER TABLE IF EXISTS cost_events ADD COLUMN IF NOT EXISTS created_at BIGINT NOT NULL DEFAULT 0"))
+        db.execute(text("ALTER TABLE IF EXISTS cost_events ADD COLUMN IF NOT EXISTS metadata TEXT"))
         # PATCH0100_12: ensure columns added after migration 0007 exist
         db.execute(text("ALTER TABLE IF EXISTS cost_events ADD COLUMN IF NOT EXISTS provider VARCHAR"))
         db.execute(text("ALTER TABLE IF EXISTS cost_events ADD COLUMN IF NOT EXISTS cost_usd NUMERIC(12,6) NOT NULL DEFAULT 0"))
@@ -1524,6 +1536,31 @@ def ensure_schema(db: Session):
 )
         """))
         db.execute(text("CREATE INDEX IF NOT EXISTS ix_founder_escalations_org_created ON founder_escalations(org_slug, created_at)"))
+        db.execute(text("""
+        CREATE TABLE IF NOT EXISTS execution_events (
+            id VARCHAR PRIMARY KEY,
+            org_slug VARCHAR NOT NULL,
+            trace_id VARCHAR,
+            thread_id VARCHAR,
+            planner_version VARCHAR,
+            primary_objective VARCHAR,
+            execution_strategy VARCHAR,
+            route_source VARCHAR,
+            route_applied BOOLEAN NOT NULL DEFAULT FALSE,
+            planned_nodes TEXT,
+            executed_nodes TEXT,
+            failed_nodes TEXT,
+            skipped_nodes TEXT,
+            planner_confidence NUMERIC(8,4) NOT NULL DEFAULT 0,
+            routing_confidence NUMERIC(8,4) NOT NULL DEFAULT 0,
+            token_cost_usd NUMERIC(12,6) NOT NULL DEFAULT 0,
+            latency_ms INTEGER NOT NULL DEFAULT 0,
+            metadata TEXT,
+            created_at BIGINT NOT NULL
+        )
+        """))
+        db.execute(text("CREATE INDEX IF NOT EXISTS ix_execution_events_org_created ON execution_events(org_slug, created_at)"))
+        db.execute(text("CREATE INDEX IF NOT EXISTS ix_execution_events_trace ON execution_events(trace_id)"))
         db.commit()
     except Exception as e:
         try: db.rollback()
@@ -4199,6 +4236,79 @@ def _track_cost(
             pass
         logger.exception("COST_EVENT_PERSIST_FAILED")
 
+
+def _track_execution_event(
+    db: Session,
+    *,
+    org: str,
+    trace_id: Optional[str],
+    thread_id: str,
+    runtime_hints: Optional[Dict[str, Any]] = None,
+    token_cost_usd: float = 0.0,
+) -> None:
+    """Persist lightweight execution telemetry for planner/routing learning. Fail-open only."""
+    try:
+        runtime_hints = runtime_hints or {}
+        planner = runtime_hints.get("planner") if isinstance(runtime_hints.get("planner"), dict) else {}
+        routing = runtime_hints.get("routing") if isinstance(runtime_hints.get("routing"), dict) else {}
+        execution_lifecycle = routing.get("execution_lifecycle") if isinstance(routing.get("execution_lifecycle"), dict) else {}
+        started_at = runtime_hints.get("started_at") or runtime_hints.get("execution_started_at")
+        finished_at = runtime_hints.get("finished_at") or runtime_hints.get("execution_finished_at") or now_ts()
+
+        latency_ms = 0
+        try:
+            if started_at:
+                latency_ms = max(0, int((int(finished_at) - int(started_at)) * 1000))
+        except Exception:
+            latency_ms = 0
+
+        db.execute(text("""
+            INSERT INTO execution_events (
+                id, org_slug, trace_id, thread_id, planner_version, primary_objective,
+                execution_strategy, route_source, route_applied, planned_nodes, executed_nodes,
+                failed_nodes, skipped_nodes, planner_confidence, routing_confidence,
+                token_cost_usd, latency_ms, metadata, created_at
+            ) VALUES (
+                :id, :org_slug, :trace_id, :thread_id, :planner_version, :primary_objective,
+                :execution_strategy, :route_source, :route_applied, :planned_nodes, :executed_nodes,
+                :failed_nodes, :skipped_nodes, :planner_confidence, :routing_confidence,
+                :token_cost_usd, :latency_ms, :metadata, :created_at
+            )
+        """), {
+            "id": new_id(),
+            "org_slug": org,
+            "trace_id": trace_id,
+            "thread_id": thread_id,
+            "planner_version": str(planner.get("version") or ""),
+            "primary_objective": str(planner.get("primary_objective") or ""),
+            "execution_strategy": str(planner.get("execution_strategy") or ""),
+            "route_source": str(routing.get("routing_source") or ""),
+            "route_applied": bool(routing.get("route_applied") or False),
+            "planned_nodes": json.dumps(list(execution_lifecycle.get("planned_nodes") or []), ensure_ascii=False),
+            "executed_nodes": json.dumps(list(runtime_hints.get("executed_nodes") or []), ensure_ascii=False),
+            "failed_nodes": json.dumps(list(runtime_hints.get("failed_nodes") or []), ensure_ascii=False),
+            "skipped_nodes": json.dumps(list(execution_lifecycle.get("skipped_nodes") or []), ensure_ascii=False),
+            "planner_confidence": float(planner.get("confidence") or 0.0),
+            "routing_confidence": float(routing.get("routing_confidence") or 0.0),
+            "token_cost_usd": float(token_cost_usd or 0.0),
+            "latency_ms": int(latency_ms or 0),
+            "metadata": json.dumps({
+                "followup_mode": runtime_hints.get("followup_mode"),
+                "trial_action": runtime_hints.get("trial_action"),
+                "visible_responder": runtime_hints.get("visible_responder"),
+                "agent_count": runtime_hints.get("agent_count"),
+            }, ensure_ascii=False),
+            "created_at": now_ts(),
+        })
+        db.commit()
+        logger.info("EXECUTION_EVENT_PERSISTED trace_id=%s thread_id=%s", trace_id, thread_id)
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        logger.exception("EXECUTION_EVENT_PERSIST_FAILED trace_id=%s thread_id=%s", trace_id, thread_id)
+
 @app.post("/api/chat", response_model=ChatOut)
 def chat(
     inp: ChatIn,
@@ -6813,6 +6923,19 @@ async def chat_stream(
                 final_runtime_enrichment["runtime_hints"] = runtime_hints_block
             except Exception:
                 final_runtime_enrichment = runtime_enrichment if isinstance(runtime_enrichment, dict) else {}
+
+            # persist execution telemetry (fail-open)
+            try:
+                _track_execution_event(
+                    db,
+                    org=org,
+                    trace_id=trace_id,
+                    thread_id=tid,
+                    runtime_hints=(final_runtime_enrichment.get("runtime_hints") if isinstance(final_runtime_enrichment, dict) else {}) or {},
+                    token_cost_usd=0.0,
+                )
+            except Exception:
+                pass
 
             # done global
             try:
