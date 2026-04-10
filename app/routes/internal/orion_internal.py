@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from .db_internal import build_schema_plan, apply_schema_plan
 from .git_internal import (
     BranchCreateIn,
     CommitFileIn,
@@ -43,23 +44,14 @@ _DEPLOY_APPROVAL_MARKERS = (
 )
 
 _GITHUB_KEYWORDS = (
-    "github",
-    "repo",
-    "repositório",
-    "repositorio",
-    "branch",
-    "ramo",
-    "commit",
-    "pull request",
-    "pr ",
-    "arquivo",
-    "file ",
-    "código",
-    "codigo",
-    "crie",
-    "criar",
-    "novo arquivo",
-    "main",
+    "github", "repo", "repositório", "repositorio", "branch", "ramo", "commit",
+    "pull request", "pr ", "arquivo", "file ", "código", "codigo", "crie",
+    "criar", "novo arquivo", "main",
+)
+
+_DB_KEYWORDS = (
+    "banco", "database", "schema", "drift", "migration", "migracao",
+    "migrar", "tabela", "coluna", "cost_events",
 )
 
 _MAIN_OVERRIDE_MARKERS = (
@@ -87,6 +79,11 @@ class OrionBranchCreateIn(BaseModel):
     source_branch: Optional[str] = None
 
 
+class OrionDbFixIn(BaseModel):
+    table: str = Field(min_length=1, max_length=120)
+    approval: Optional[str] = None
+
+
 def _env(name: str, default: str = "") -> str:
     return (os.getenv(name, default) or "").strip().strip('"').strip("'")
 
@@ -99,6 +96,11 @@ def is_orion_agent_name(name: Optional[str]) -> bool:
 def has_github_intent(message: str) -> bool:
     s = (message or "").lower()
     return any(k in s for k in _GITHUB_KEYWORDS)
+
+
+def has_db_intent(message: str) -> bool:
+    s = (message or "").lower()
+    return any(k in s for k in _DB_KEYWORDS)
 
 
 def has_explicit_patch_approval(message: str) -> bool:
@@ -170,21 +172,18 @@ def _extract_content_literal(message: str) -> Optional[str]:
     code_blocks = re.findall(r"```(?:[a-zA-Z0-9_+-]+)?\n([\s\S]*?)```", s)
     if code_blocks:
         return code_blocks[0].strip()
-
     quoted = re.search(r'conte[uú]do\s*[:=]\s*"([\s\S]+)"', s, flags=re.IGNORECASE)
     if quoted:
         return quoted.group(1).strip()
     quoted = re.search(r"conte[uú]do\s*[:=]\s*'([\s\S]+)'", s, flags=re.IGNORECASE)
     if quoted:
         return quoted.group(1).strip()
-
     m = re.search(r'com\s+conte[uú]do\s+"([\s\S]+)"', s, flags=re.IGNORECASE)
     if m:
         return m.group(1).strip()
     m = re.search(r"com\s+conte[uú]do\s+'([\s\S]+)'", s, flags=re.IGNORECASE)
     if m:
         return m.group(1).strip()
-
     m = re.search(r'com\s+conte[uú]do\s*[:=]?\s*([\s\S]+)$', s, flags=re.IGNORECASE)
     if m:
         return m.group(1).strip()
@@ -204,6 +203,14 @@ def _extract_branch_create_name(message: str) -> Optional[str]:
     return None
 
 
+def _extract_db_table(message: str) -> str:
+    low = (message or "").lower()
+    for table_name in ("cost_events",):
+        if table_name in low:
+            return table_name
+    return "cost_events"
+
+
 def _looks_like_create_branch(message: str) -> bool:
     low = (message or "").lower()
     return ("branch" in low or "ramo" in low) and any(k in low for k in ("crie", "criar", "abra", "gerar"))
@@ -219,39 +226,39 @@ def resolve_orion_github_operation(message: str) -> Dict[str, Any]:
     low = s.lower()
     if not has_github_intent(low):
         return {"kind": "none"}
-
     branch = _extract_branch(s)
     path = _extract_path(s)
-
     if any(k in low for k in ("acesso", "access", "health", "status", "conect")):
         return {"kind": "health", "branch": branch}
     if any(k in low for k in ("árvore", "arvore", "tree", "listar repo", "listar reposit", "liste o repo", "listar arquivos")):
         return {"kind": "tree", "branch": branch}
     if _looks_like_create_branch(s):
-        return {
-            "kind": "create_branch",
-            "branch_name": _extract_branch_create_name(s),
-            "source_branch": _env("GITHUB_BRANCH", "main"),
-        }
+        return {"kind": "create_branch", "branch_name": _extract_branch_create_name(s), "source_branch": _env("GITHUB_BRANCH", "main")}
     if path and _looks_like_create_file(s):
-        return {
-            "kind": "create_file",
-            "branch": branch,
-            "path": path,
-            "content": _extract_content_literal(s) or "",
-        }
+        return {"kind": "create_file", "branch": branch, "path": path, "content": _extract_content_literal(s) or ""}
     if any(k in low for k in ("corrija", "corrigir", "ajuste", "ajustar", "aplique", "aplicar", "fix", "patch")) and path:
         return {"kind": "write_fix", "branch": branch, "path": path}
     if path and any(k in low for k in ("arquivo", "file", "ler", "abra", "mostrar", "mostre", "analise")):
         return {"kind": "file", "branch": branch, "path": path}
-
     search_query = _extract_search_query(s)
     if search_query:
         return {"kind": "search", "branch": branch, "query": search_query}
-
     if path:
         return {"kind": "file", "branch": branch, "path": path}
     return {"kind": "tree", "branch": branch}
+
+
+def resolve_orion_db_operation(message: str) -> Dict[str, Any]:
+    s = (message or "").strip()
+    low = s.lower()
+    if not has_db_intent(low):
+        return {"kind": "none"}
+    table = _extract_db_table(s)
+    if any(k in low for k in ("verifique", "verificar", "check", "inspecione", "drift", "schema")):
+        return {"kind": "db_check", "table": table}
+    if any(k in low for k in ("corrija", "corrigir", "aplique", "aplicar", "ajuste", "ajustar", "migration", "migracao")):
+        return {"kind": "db_fix", "table": table}
+    return {"kind": "db_check", "table": table}
 
 
 def run_orion_github_read(op: Dict[str, Any]) -> Dict[str, Any]:
@@ -267,6 +274,16 @@ def run_orion_github_read(op: Dict[str, Any]) -> Dict[str, Any]:
     raise HTTPException(status_code=400, detail=f"Unsupported Orion GitHub read op: {kind}")
 
 
+def run_orion_db_check(table: str) -> Dict[str, Any]:
+    return build_schema_plan(table)
+
+
+def run_orion_db_fix(table: str, approval: Optional[str]) -> Dict[str, Any]:
+    if not has_explicit_patch_approval(approval or ""):
+        raise HTTPException(status_code=400, detail="Explicit DB approval required")
+    return apply_schema_plan(table)
+
+
 def create_orion_branch_name(path: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9/_\-.]+", "-", (path or "change").strip().lower()).strip("-")
     cleaned = cleaned.replace("/", "-").replace("_", "-").replace(".", "-")
@@ -274,88 +291,32 @@ def create_orion_branch_name(path: str) -> str:
     return f"orion-fix/{cleaned}-{int(time.time())}"
 
 
-def resolve_target_branch_for_write(message: str, path: str, explicit_branch: Optional[str] = None) -> str:
-    if explicit_branch and explicit_branch.strip():
-        return explicit_branch.strip()
-    if has_explicit_main_override(message):
-        return (_env("GITHUB_BRANCH", "main") or "main").strip()
-    return create_orion_branch_name(path)
-
-
 def execute_orion_single_file_fix(payload: OrionGitWriteIn) -> Dict[str, Any]:
     branch_name = (payload.branch or "").strip() or create_orion_branch_name(payload.path)
     base_branch = (payload.base_branch or _env("GITHUB_BRANCH", "main") or "main").strip()
-
     if branch_name != base_branch:
-        git_create_branch(
-            BranchCreateIn(
-                branch_name=branch_name,
-                source_branch=base_branch,
-            )
-        )
-
-    commit_result = git_commit_file(
-        CommitFileIn(
-            path=payload.path,
-            content=payload.content,
-            message=payload.commit_message,
-            branch=branch_name,
-        )
-    )
-
+        git_create_branch(BranchCreateIn(branch_name=branch_name, source_branch=base_branch))
+    commit_result = git_commit_file(CommitFileIn(path=payload.path, content=payload.content, message=payload.commit_message, branch=branch_name))
     pr_result: Dict[str, Any] = {"ok": False, "created": False}
     if payload.open_pr and branch_name != base_branch:
         try:
-            pr_result = git_open_pr(
-                PullRequestIn(
-                    title=payload.commit_message[:200],
-                    body=f"Governed Orion fix for `{payload.path}`.",
-                    head=branch_name,
-                    base=base_branch,
-                )
-            )
+            pr_result = git_open_pr(PullRequestIn(title=payload.commit_message[:200], body=f"Governed Orion fix for `{payload.path}`.", head=branch_name, base=base_branch))
             pr_result["created"] = True
         except Exception as e:
             pr_result = {"ok": False, "created": False, "error": str(e)}
-
-    return {
-        "ok": True,
-        "repo": _env("GITHUB_REPO"),
-        "base_branch": base_branch,
-        "branch": branch_name,
-        "path": payload.path,
-        "commit": commit_result,
-        "pull_request": pr_result,
-    }
+    return {"ok": True, "repo": _env("GITHUB_REPO"), "base_branch": base_branch, "branch": branch_name, "path": payload.path, "commit": commit_result, "pull_request": pr_result}
 
 
 def execute_orion_branch_create(*, branch_name: str, source_branch: Optional[str] = None) -> Dict[str, Any]:
     if not (branch_name or "").strip():
         raise HTTPException(status_code=400, detail="branch_name required")
-    data = git_create_branch(
-        BranchCreateIn(
-            branch_name=branch_name.strip(),
-            source_branch=(source_branch or _env("GITHUB_BRANCH", "main") or "main").strip(),
-        )
-    )
-    return {
-        "ok": True,
-        "repo": _env("GITHUB_REPO"),
-        "source_branch": data.get("source_branch"),
-        "branch": data.get("new_branch"),
-        "ref": data.get("ref"),
-        "sha": data.get("sha"),
-    }
+    data = git_create_branch(BranchCreateIn(branch_name=branch_name.strip(), source_branch=(source_branch or _env("GITHUB_BRANCH", "main") or "main").strip()))
+    return {"ok": True, "repo": _env("GITHUB_REPO"), "source_branch": data.get("source_branch"), "branch": data.get("new_branch"), "ref": data.get("ref"), "sha": data.get("sha")}
 
 
 @router.get("/health")
 def orion_health():
-    return {
-        "ok": True,
-        "service": "orion_internal",
-        "github_bridge_ready": bool(_env("GITHUB_TOKEN")) and bool(_env("GITHUB_REPO")),
-        "default_branch": _env("GITHUB_BRANCH", "main"),
-    }
+    return {"ok": True, "service": "orion_internal", "github_bridge_ready": bool(_env("GITHUB_TOKEN")) and bool(_env("GITHUB_REPO")), "default_branch": _env("GITHUB_BRANCH", "main")}
 
 
 @router.post("/github/write")
@@ -365,7 +326,14 @@ def orion_github_write(payload: OrionGitWriteIn):
 
 @router.post("/github/branch")
 def orion_github_branch(payload: OrionBranchCreateIn):
-    return execute_orion_branch_create(
-        branch_name=payload.branch_name,
-        source_branch=payload.source_branch,
-    )
+    return execute_orion_branch_create(branch_name=payload.branch_name, source_branch=payload.source_branch)
+
+
+@router.get("/db/check")
+def orion_db_check(table: str = "cost_events"):
+    return run_orion_db_check(table)
+
+
+@router.post("/db/fix")
+def orion_db_fix(payload: OrionDbFixIn):
+    return run_orion_db_fix(payload.table, payload.approval)
