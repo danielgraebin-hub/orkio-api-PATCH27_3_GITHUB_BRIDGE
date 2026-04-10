@@ -4420,6 +4420,7 @@ def _get_runtime_capability_registry() -> Dict[str, Any]:
             "github_list_branches",
             "github_list_files",
             "github_create_pull_request",
+            "github_commit_batch",
         ])
     return {
         "available": available,
@@ -4671,6 +4672,57 @@ def _extract_github_create_pr_request(user_text: str) -> Optional[Dict[str, str]
 
 
 
+
+
+def _extract_github_batch_update_request(user_text: str) -> Optional[Dict[str, Any]]:
+    txt = (user_text or "").strip()
+    low = txt.lower()
+    trigger_patterns = [
+        "commit em lote",
+        "batch commit",
+        "atualize estes arquivos",
+        "update these files",
+    ]
+    if not any(p in low for p in trigger_patterns):
+        return None
+
+    m_branch = re.search(r"(?:na branch|on branch)[: ]+([A-Za-z0-9._/\-]{1,120})", txt, flags=re.IGNORECASE)
+    branch = (m_branch.group(1) or "").strip() if m_branch else ""
+    m_title = re.search(r"(?:t[íi]tulo|title)[: ]+(.+?)(?:\n|$)", txt, flags=re.IGNORECASE)
+    title = (m_title.group(1) or "").strip() if m_title else "Batch update"
+
+    blocks: List[str] = []
+    for line in txt.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("-"):
+            continue
+        blocks.append(stripped.lstrip("-").strip())
+
+    changes: List[Dict[str, str]] = []
+    for block in blocks:
+        m = re.match(
+            r"([A-Za-z0-9._/\-]{1,160})\s*(?:=>|:)\s*(?:conte[uú]do|content|append|adicionando a linha)?\s*:?\s*(.+)$",
+            block,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not m:
+            continue
+        path = (m.group(1) or "").strip()
+        payload = (m.group(2) or "").strip()
+        if not path or path.startswith("/") or ".." in path or "\\" in path:
+            return {"invalid": "unsafe_path"}
+        mode = "replace"
+        if re.search(r"\bappend\b|adicionando a linha", block, flags=re.IGNORECASE):
+            mode = "append"
+        changes.append({"path": path, "content": payload, "mode": mode})
+
+    if not changes:
+        return {"invalid": "missing_changes"}
+
+    result: Dict[str, Any] = {"changes": changes, "title": title}
+    if branch:
+        result["branch"] = branch
+    return result
 def _build_execution_result_payload(result: Dict[str, Any]) -> str:
     if not result:
         return "Ação processada."
@@ -5033,6 +5085,124 @@ def _github_compare_branches(repo: str, base: str, head: str) -> Dict[str, Any]:
         "body": body,
     }
 
+
+
+def _github_get_ref_sha(repo: str, branch: str) -> tuple[str, Dict[str, Any]]:
+    status, body = _github_api_json("GET", f"https://api.github.com/repos/{repo}/git/ref/heads/{branch}", None)
+    if status != 200 or not isinstance(body, dict):
+        return "", body or {}
+    sha = str((((body or {}).get("object") or {}).get("sha") or "")).strip()
+    return sha, body
+
+
+def _github_get_commit_tree_sha(repo: str, commit_sha: str) -> tuple[str, Dict[str, Any]]:
+    status, body = _github_api_json("GET", f"https://api.github.com/repos/{repo}/git/commits/{commit_sha}", None)
+    if status != 200 or not isinstance(body, dict):
+        return "", body or {}
+    tree_sha = str((((body or {}).get("tree") or {}).get("sha") or "")).strip()
+    return tree_sha, body
+
+
+def _github_commit_batch_capability(*, changes: List[Dict[str, str]], branch: Optional[str] = None, title: Optional[str] = None, trace_id: Optional[str] = None) -> Dict[str, Any]:
+    repo = _clean_env(os.getenv("GITHUB_REPO", ""))
+    branch = (_clean_env(branch or "", default="") or _clean_env(os.getenv("GITHUB_BRANCH", "main"), default="main") or "main")
+    token = _clean_env(os.getenv("GITHUB_TOKEN", ""))
+    if not token or not repo:
+        return {"handled": True, "success": False, "provider": "github", "message": "GitHub capability não está habilitada no ambiente."}
+    normalized_changes: List[Dict[str, str]] = []
+    for item in changes or []:
+        path = str((item or {}).get("path") or "").strip()
+        content = str((item or {}).get("content") or "")
+        mode = str((item or {}).get("mode") or "replace").strip().lower() or "replace"
+        if not path or path.startswith("/") or ".." in path or "\\" in path:
+            return {"handled": True, "success": False, "provider": "github", "message": f"Caminho inseguro detectado no lote: '{path}'."}
+        if mode not in {"replace", "append"}:
+            mode = "replace"
+        normalized_changes.append({"path": path, "content": content, "mode": mode})
+    if not normalized_changes:
+        return {"handled": True, "success": False, "provider": "github", "message": "Nenhuma alteração válida foi informada para o commit em lote."}
+
+    base_sha, base_body = _github_get_ref_sha(repo, branch)
+    if not base_sha:
+        return {"handled": True, "success": False, "provider": "github", "repo": repo, "branch": branch, "message": (base_body.get("message") if isinstance(base_body, dict) else None) or f"Não foi possível resolver a branch '{branch}'."}
+    base_tree_sha, tree_body = _github_get_commit_tree_sha(repo, base_sha)
+    if not base_tree_sha:
+        return {"handled": True, "success": False, "provider": "github", "repo": repo, "branch": branch, "message": (tree_body.get("message") if isinstance(tree_body, dict) else None) or "Não foi possível resolver a árvore base do commit."}
+
+    tree_entries: List[Dict[str, Any]] = []
+    changed_paths: List[str] = []
+    _github_log("GITHUB_BATCH_ATTEMPT", repo=repo, branch=branch, files_count=len(normalized_changes), trace_id=trace_id or "")
+    for item in normalized_changes:
+        path = item["path"]
+        mode = item["mode"]
+        desired_content = item["content"]
+        final_content = desired_content
+        if mode == "append":
+            status_get, body_get = _github_api_json("GET", f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}", None)
+            if status_get != 200 or not isinstance(body_get, dict):
+                return {"handled": True, "success": False, "provider": "github", "repo": repo, "branch": branch, "path": path, "message": f"O arquivo '{path}' não existe na branch '{branch}' para operação append."}
+            existing_text = ""
+            try:
+                existing_text = base64.b64decode(((body_get or {}).get("content") or "").encode("utf-8")).decode("utf-8", errors="replace")
+            except Exception:
+                existing_text = ""
+            final_content = existing_text
+            if final_content and not final_content.endswith("\n"):
+                final_content += "\n"
+            final_content += desired_content
+        tree_entries.append({
+            "path": path,
+            "mode": "100644",
+            "type": "blob",
+            "content": final_content,
+        })
+        changed_paths.append(path)
+
+    tree_payload = {"base_tree": base_tree_sha, "tree": tree_entries}
+    status_tree, body_tree = _github_api_json("POST", f"https://api.github.com/repos/{repo}/git/trees", tree_payload)
+    new_tree_sha = str((body_tree or {}).get("sha") or "").strip() if isinstance(body_tree, dict) else ""
+    if status_tree not in (200, 201) or not new_tree_sha:
+        _github_log("GITHUB_BATCH_FAILED", repo=repo, branch=branch, stage="tree", status=status_tree, trace_id=trace_id or "")
+        return {"handled": True, "success": False, "provider": "github", "repo": repo, "branch": branch, "message": (body_tree.get("message") if isinstance(body_tree, dict) else None) or "Falha ao montar a árvore Git para o commit em lote."}
+
+    commit_message = (title or "orkio: batch commit").strip() or "orkio: batch commit"
+    if trace_id:
+        commit_message = f"{commit_message} [{trace_id}]"
+    commit_payload = {"message": commit_message, "tree": new_tree_sha, "parents": [base_sha]}
+    status_commit, body_commit = _github_api_json("POST", f"https://api.github.com/repos/{repo}/git/commits", commit_payload)
+    new_commit_sha = str((body_commit or {}).get("sha") or "").strip() if isinstance(body_commit, dict) else ""
+    if status_commit not in (200, 201) or not new_commit_sha:
+        _github_log("GITHUB_BATCH_FAILED", repo=repo, branch=branch, stage="commit", status=status_commit, trace_id=trace_id or "")
+        return {"handled": True, "success": False, "provider": "github", "repo": repo, "branch": branch, "message": (body_commit.get("message") if isinstance(body_commit, dict) else None) or "Falha ao criar commit Git para o lote."}
+
+    ref_payload = {"sha": new_commit_sha, "force": False}
+    status_ref, body_ref = _github_api_json("PATCH", f"https://api.github.com/repos/{repo}/git/refs/heads/{branch}", ref_payload)
+    if status_ref not in (200, 201):
+        _github_log("GITHUB_BATCH_FAILED", repo=repo, branch=branch, stage="ref", status=status_ref, trace_id=trace_id or "")
+        return {"handled": True, "success": False, "provider": "github", "repo": repo, "branch": branch, "message": (body_ref.get("message") if isinstance(body_ref, dict) else None) or "Falha ao atualizar a referência da branch após o commit em lote."}
+
+    verified_all = True
+    for path in changed_paths:
+        ok, _, _ = _github_verify_file_exists(repo=repo, path=path, branch=branch)
+        if not ok:
+            verified_all = False
+            break
+    if not verified_all:
+        _github_log("GITHUB_BATCH_VERIFY_FAILED", repo=repo, branch=branch, files_count=len(changed_paths), trace_id=trace_id or "")
+        return {"handled": True, "success": False, "provider": "github", "repo": repo, "branch": branch, "message": "Commit em lote enviado ao GitHub, mas sem confirmação verificável de todos os arquivos."}
+
+    _github_log("GITHUB_BATCH_VERIFY_OK", repo=repo, branch=branch, files_count=len(changed_paths), sha=new_commit_sha, trace_id=trace_id or "")
+    return {
+        "handled": True,
+        "success": True,
+        "provider": "github",
+        "repo": repo,
+        "branch": branch,
+        "commit_sha": new_commit_sha,
+        "files": changed_paths,
+        "title": title or "Batch commit",
+        "message": "Commit em lote executado com confirmação operacional.",
+    }
 def _github_create_pull_request_capability(*, head: str, base: str, title: str, trace_id: Optional[str] = None) -> Dict[str, Any]:
     repo = _clean_env(os.getenv("GITHUB_REPO", ""))
     token = _clean_env(os.getenv("GITHUB_TOKEN", ""))
@@ -5075,6 +5245,19 @@ def _github_create_pull_request_capability(*, head: str, base: str, title: str, 
     return {"handled": True, "success": True, "provider": "github", "repo": repo, "branch": head, "base_branch": base, "pull_request_number": number, "pull_request_url": html_url, "title": pr_title, "message": "Pull request criado com confirmação operacional verificável."}
 
 def _execute_capability_if_authorized(user_text: str, *, trace_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    req_batch = _extract_github_batch_update_request(user_text)
+    if req_batch:
+        if req_batch.get("invalid") == "unsafe_path":
+            return {"handled": True, "success": False, "provider": "github", "message": "Um ou mais caminhos do lote não são seguros."}
+        if req_batch.get("invalid") == "missing_changes":
+            return {"handled": True, "success": False, "provider": "github", "message": "Informe ao menos um arquivo válido no lote."}
+        return _github_commit_batch_capability(
+            changes=list(req_batch.get("changes") or []),
+            branch=str(req_batch.get("branch") or "").strip() or None,
+            title=str(req_batch.get("title") or "").strip() or None,
+            trace_id=trace_id,
+        )
+
     req_pr = _extract_github_create_pr_request(user_text)
     if req_pr:
         return _github_create_pull_request_capability(
