@@ -4723,51 +4723,206 @@ def _extract_github_batch_update_request(user_text: str) -> Optional[Dict[str, A
     if branch:
         result["branch"] = branch
     return result
+
 def _build_execution_result_payload(result: Dict[str, Any]) -> str:
     if not result:
         return "Ação processada."
     if not result.get("success"):
         msg = (result.get("message") or "Não foi possível concluir a ação solicitada.").strip()
         return msg
+
     provider = (result.get("provider") or "provider").strip()
     repo = (result.get("repo") or "").strip()
     branch = (result.get("branch") or "").strip()
     path = (result.get("path") or "").strip()
     commit_sha = (result.get("commit_sha") or "").strip()
+    event = (result.get("event") or "").strip()
+
     parts = ["Ação executada com confirmação operacional."]
+    if event:
+        parts.append(f"event: {event}")
     if provider:
         parts.append(f"provider: {provider}")
     if repo:
         parts.append(f"repo: {repo}")
     if branch:
         parts.append(f"branch: {branch}")
+
     base_branch = (result.get("base_branch") or "").strip()
     if path:
         parts.append(f"path: {path}")
     if base_branch:
         parts.append(f"base_branch: {base_branch}")
+
+    size_bytes = result.get("size_bytes")
+    sha = (result.get("sha") or "").strip()
+    query = (result.get("query") or "").strip()
+    scope = (result.get("scope") or "").strip()
+    module_name = (result.get("module_name") or "").strip()
+    title = (result.get("title") or "").strip()
+    root_path = (result.get("root_path") or "").strip()
+    technical_summary = (result.get("technical_summary") or "").strip()
+
     pr_num = int(result.get("pull_request_number") or 0)
     pr_url = (result.get("pull_request_url") or "").strip()
     branches = result.get("branches") if isinstance(result.get("branches"), list) else None
     files = result.get("files") if isinstance(result.get("files"), list) else None
-    title = (result.get("title") or "").strip()
+    files_read = result.get("files_read") if isinstance(result.get("files_read"), list) else None
+    missing_files = result.get("missing_files") if isinstance(result.get("missing_files"), list) else None
+    excerpts = result.get("excerpts") if isinstance(result.get("excerpts"), list) else None
+    snippets = result.get("snippets") if isinstance(result.get("snippets"), list) else None
+    findings = result.get("findings") if isinstance(result.get("findings"), list) else None
+    risks = result.get("risks") if isinstance(result.get("risks"), list) else None
+    suggested_actions = result.get("suggested_actions") if isinstance(result.get("suggested_actions"), list) else None
+    key_files = result.get("key_files") if isinstance(result.get("key_files"), list) else None
+    key_functions = result.get("key_functions") if isinstance(result.get("key_functions"), list) else None
+    related_modules = result.get("related_modules") if isinstance(result.get("related_modules"), list) else None
+    risk_points = result.get("risk_points") if isinstance(result.get("risk_points"), list) else None
+    architecture_notes = result.get("architecture_notes") if isinstance(result.get("architecture_notes"), list) else None
+    remediation_plan = result.get("remediation_plan") if isinstance(result.get("remediation_plan"), list) else None
+    total_entries = result.get("total_entries")
+    dirs = result.get("dirs") if isinstance(result.get("dirs"), list) else None
+    confidence = result.get("confidence")
+
     if commit_sha:
         parts.append(f"commit: {commit_sha[:12]}")
-    if pr_num:
-        parts.append(f"pull_request: #{pr_num}")
+    if sha:
+        parts.append(f"sha: {sha[:12]}")
+    if size_bytes not in (None, ""):
+        parts.append(f"size_bytes: {size_bytes}")
+    if query:
+        parts.append(f"query: {query}")
+    if scope:
+        parts.append(f"scope: {scope}")
+    if module_name:
+        parts.append(f"module_name: {module_name}")
     if title:
         parts.append(f"title: {title}")
+    if root_path:
+        parts.append(f"root_path: {root_path}")
+    if total_entries not in (None, ""):
+        parts.append(f"total_entries: {total_entries}")
+    if pr_num:
+        parts.append(f"pull_request: #{pr_num}")
     if pr_url:
         parts.append(f"url: {pr_url}")
+    if confidence not in (None, ""):
+        try:
+            parts.append(f"confidence: {float(confidence):.2f}")
+        except Exception:
+            parts.append(f"confidence: {confidence}")
+
+    if technical_summary:
+        parts.append("technical_summary:")
+        parts.append(technical_summary)
+
+    content_excerpt = (result.get("content_excerpt") or "").strip()
+    if content_excerpt:
+        parts.append("content_excerpt:")
+        parts.append(content_excerpt[:4000])
+
     if branches is not None:
         parts.append("branches:")
         parts.extend(f"- {b}" for b in branches[:50])
+
     if files is not None:
         parts.append("files:")
-        parts.extend(f"- {f}" for f in files[:100])
+        parts.extend(f"- {f}" for f in files[:120])
+
+    if dirs is not None:
+        parts.append("dirs:")
+        parts.extend(f"- {d}" for d in dirs[:120])
+
+    if files_read is not None:
+        parts.append("files_read:")
+        parts.extend(f"- {f}" for f in files_read[:50])
+
+    if missing_files is not None:
+        parts.append("missing_files:")
+        parts.extend(f"- {f}" for f in missing_files[:50])
+
+    if excerpts:
+        parts.append("excerpts:")
+        for item in excerpts[:12]:
+            if not isinstance(item, dict):
+                continue
+            item_path = str(item.get("path") or "").strip()
+            item_sha = str(item.get("sha") or "").strip()
+            truncated = bool(item.get("truncated"))
+            excerpt = str(item.get("content_excerpt") or "").strip()
+            header = f"- {item_path or 'arquivo'}"
+            if item_sha:
+                header += f" sha={item_sha[:12]}"
+            if truncated:
+                header += " truncated=true"
+            parts.append(header)
+            if excerpt:
+                parts.append(excerpt[:1200])
+
+    if snippets:
+        parts.append("snippets:")
+        for item in snippets[:20]:
+            if not isinstance(item, dict):
+                continue
+            item_path = str(item.get("path") or "").strip()
+            line_no = item.get("line")
+            snippet = str(item.get("snippet") or "").strip()
+            header = f"- {item_path or 'arquivo'}"
+            if line_no not in (None, ""):
+                header += f":{line_no}"
+            parts.append(header)
+            if snippet:
+                parts.append(snippet[:800])
+
+    if findings:
+        parts.append("findings:")
+        for item in findings[:20]:
+            if isinstance(item, dict):
+                severity = str(item.get("severity") or "").strip()
+                title_item = str(item.get("title") or "").strip()
+                detail = str(item.get("detail") or "").strip()
+                line = f"- {severity + ' ' if severity else ''}{title_item}".strip()
+                parts.append(line)
+                if detail:
+                    parts.append(detail[:800])
+            else:
+                parts.append(f"- {str(item)}")
+
+    if risks:
+        parts.append("risks:")
+        for item in risks[:20]:
+            parts.append(f"- {str(item)}")
+
+    if suggested_actions:
+        parts.append("suggested_actions:")
+        for item in suggested_actions[:20]:
+            parts.append(f"- {str(item)}")
+
+    if key_files:
+        parts.append("key_files:")
+        parts.extend(f"- {str(item)}" for item in key_files[:50])
+
+    if key_functions:
+        parts.append("key_functions:")
+        parts.extend(f"- {str(item)}" for item in key_functions[:50])
+
+    if related_modules:
+        parts.append("related_modules:")
+        parts.extend(f"- {str(item)}" for item in related_modules[:50])
+
+    if risk_points:
+        parts.append("risk_points:")
+        parts.extend(f"- {str(item)}" for item in risk_points[:50])
+
+    if architecture_notes:
+        parts.append("architecture_notes:")
+        parts.extend(f"- {str(item)}" for item in architecture_notes[:50])
+
+    if remediation_plan:
+        parts.append("remediation_plan:")
+        parts.extend(f"- {str(item)}" for item in remediation_plan[:50])
+
     return "\n".join(parts)
-
-
 
 def _github_create_file_capability(*, path: str, content: str, trace_id: Optional[str] = None) -> Dict[str, Any]:
     repo = _clean_env(os.getenv("GITHUB_REPO", ""))
@@ -4875,6 +5030,617 @@ def _github_create_branch_capability(*, branch: str, trace_id: Optional[str] = N
     repo = _clean_env(os.getenv("GITHUB_REPO", ""))
     base_branch = _clean_env(os.getenv("GITHUB_BRANCH", "main"), default="main") or "main"
     token = _clean_env(os.getenv("GITHUB_TOKEN", ""))
+
+
+_GITHUB_READ_FILE_MAX_CHARS = 12000
+_GITHUB_MULTI_READ_LIMIT = 8
+_GITHUB_TREE_LIMIT = 400
+_GITHUB_SEARCH_FILE_LIMIT = 24
+_GITHUB_SEARCH_SNIPPET_LIMIT = 20
+
+
+def _github_resolve_repo_branch(branch: Optional[str] = None) -> tuple[str, str, str]:
+    repo = _clean_env(os.getenv("GITHUB_REPO", ""))
+    resolved_branch = (_clean_env(branch or "", default="") or _clean_env(os.getenv("GITHUB_BRANCH", "main"), default="main") or "main")
+    token = _clean_env(os.getenv("GITHUB_TOKEN", ""))
+    return repo, resolved_branch, token
+
+
+def _github_safe_path(path: str) -> bool:
+    p = (path or "").strip()
+    if not p:
+        return False
+    if p.startswith("/") or p.startswith(".git") or ".." in p or "\\" in p:
+        return False
+    return True
+
+
+def _github_should_read_file(path: str) -> bool:
+    p = (path or "").strip().lower()
+    if not p or p.endswith("/"):
+        return False
+    blocked_suffixes = {
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".zip", ".tar", ".gz",
+        ".mp3", ".mp4", ".mov", ".avi", ".wav", ".ogg", ".ttf", ".woff", ".woff2", ".jar",
+        ".bin", ".exe", ".dll", ".so", ".dylib", ".lock"
+    }
+    if any(p.endswith(suf) for suf in blocked_suffixes):
+        return False
+    return True
+
+
+def _github_guess_scope_from_text(user_text: str) -> str:
+    low = (user_text or "").strip().lower()
+    if any(x in low for x in ["frontend", "web", "react", "vite", "ui"]):
+        return "frontend"
+    if any(x in low for x in ["backend", "api", "fastapi", "python"]):
+        return "backend"
+    return "repo"
+
+
+def _github_guess_module_name(user_text: str) -> str:
+    txt = (user_text or "").strip()
+    patterns = [
+        r"m[oó]dulo\s+de\s+([a-zA-Z0-9_./\-]+)",
+        r"module\s+([a-zA-Z0-9_./\-]+)",
+        r"fluxo\s+([a-zA-Z0-9_./\-]+)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, txt, flags=re.IGNORECASE)
+        if m:
+            return str(m.group(1) or "").strip()
+    return ""
+
+
+def _github_extract_branch_from_text(user_text: str) -> str:
+    txt = (user_text or "").strip()
+    for pat in [
+        r"branch\s+([A-Za-z0-9._/\-]{1,120})",
+        r"na\s+branch\s+([A-Za-z0-9._/\-]{1,120})",
+        r"from\s+branch\s+([A-Za-z0-9._/\-]{1,120})",
+    ]:
+        m = re.search(pat, txt, flags=re.IGNORECASE)
+        if m:
+            return re.sub(r"^refs/heads/", "", str(m.group(1) or "").strip())
+    return ""
+
+
+def _github_read_file_via_contents(repo: str, branch: str, path: str, *, max_chars: int = _GITHUB_READ_FILE_MAX_CHARS) -> Dict[str, Any]:
+    if not _github_safe_path(path):
+        return {"ok": False, "message": "Caminho solicitado não é seguro."}
+    url = f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}"
+    status, body = _github_api_json("GET", url, None)
+    if status != 200 or not isinstance(body, dict):
+        return {"ok": False, "status": status, "message": (body.get("message") if isinstance(body, dict) else None) or "Falha ao ler arquivo no GitHub."}
+    if str(body.get("type") or "").strip() != "file":
+        return {"ok": False, "status": status, "message": "O caminho solicitado não aponta para um arquivo."}
+    encoding = str(body.get("encoding") or "").strip().lower()
+    raw_content = body.get("content") or ""
+    decoded = ""
+    try:
+        if encoding == "base64":
+            decoded = base64.b64decode(str(raw_content or "").encode("ascii"), validate=False).decode("utf-8", errors="replace")
+        else:
+            decoded = str(raw_content or "")
+    except Exception:
+        decoded = str(raw_content or "")
+    truncated = False
+    excerpt = decoded
+    if len(excerpt) > max_chars:
+        excerpt = excerpt[:max_chars]
+        truncated = True
+    return {
+        "ok": True,
+        "repo": repo,
+        "branch": branch,
+        "path": path,
+        "size_bytes": int(body.get("size") or len(decoded.encode("utf-8", errors="ignore"))),
+        "sha": str(body.get("sha") or "").strip(),
+        "content": decoded,
+        "content_excerpt": excerpt,
+        "truncated": truncated,
+    }
+
+
+def _github_tree_recursive(repo: str, branch: str, root_path: str = "") -> Dict[str, Any]:
+    ref_sha, _ = _github_get_ref_sha(repo, branch)
+    if not ref_sha:
+        return {"ok": False, "message": f"Não foi possível resolver a branch '{branch}'."}
+    tree_sha, _ = _github_get_commit_tree_sha(repo, ref_sha)
+    if not tree_sha:
+        return {"ok": False, "message": f"Não foi possível resolver a árvore da branch '{branch}'."}
+    status, body = _github_api_json("GET", f"https://api.github.com/repos/{repo}/git/trees/{tree_sha}?recursive=1", None)
+    if status != 200 or not isinstance(body, dict):
+        return {"ok": False, "message": "Falha ao ler a árvore recursiva do repositório."}
+    all_items = body.get("tree") if isinstance(body.get("tree"), list) else []
+    normalized_root = (root_path or "").strip().strip("/")
+    filtered = []
+    for item in all_items:
+        if not isinstance(item, dict):
+            continue
+        item_path = str(item.get("path") or "").strip()
+        if not item_path:
+            continue
+        if normalized_root and not (item_path == normalized_root or item_path.startswith(normalized_root + "/")):
+            continue
+        filtered.append(item)
+    files = [str(x.get("path") or "").strip() for x in filtered if str(x.get("type") or "").strip() == "blob"]
+    dirs = [str(x.get("path") or "").strip() for x in filtered if str(x.get("type") or "").strip() == "tree"]
+    files = [x for x in files if x][: _GITHUB_TREE_LIMIT]
+    dirs = [x for x in dirs if x][: _GITHUB_TREE_LIMIT]
+    return {
+        "ok": True,
+        "repo": repo,
+        "branch": branch,
+        "root_path": normalized_root,
+        "total_entries": len(filtered),
+        "files": files,
+        "dirs": dirs,
+    }
+
+
+def _github_extract_read_file_request(user_text: str) -> Optional[Dict[str, str]]:
+    txt = (user_text or "").strip()
+    if not txt:
+        return None
+    patterns = [
+        r"leia\s+o\s+arquivo\s+([A-Za-z0-9._/\-]{1,240})",
+        r"read\s+the\s+file\s+([A-Za-z0-9._/\-]{1,240})",
+        r"mostrar\s+arquivo\s+([A-Za-z0-9._/\-]{1,240})",
+    ]
+    path = ""
+    for pat in patterns:
+        m = re.search(pat, txt, flags=re.IGNORECASE)
+        if m:
+            path = str(m.group(1) or "").strip()
+            break
+    if not path:
+        return None
+    return {"path": path, "branch": _github_extract_branch_from_text(txt)}
+
+
+def _github_extract_multiple_files_request(user_text: str) -> Optional[Dict[str, Any]]:
+    txt = (user_text or "").strip()
+    if not txt:
+        return None
+    low = txt.lower()
+    if not any(x in low for x in ["leia estes arquivos", "read these files", "arquivos:"]):
+        return None
+    paths = re.findall(r"(?:^|\n)\s*[-•]\s*([A-Za-z0-9._/\-]{1,240})", txt, flags=re.IGNORECASE)
+    cleaned = []
+    for p in paths:
+        p = str(p or "").strip()
+        if p and p not in cleaned:
+            cleaned.append(p)
+    if not cleaned:
+        return None
+    return {"paths": cleaned[:_GITHUB_MULTI_READ_LIMIT], "branch": _github_extract_branch_from_text(txt)}
+
+
+def _github_extract_tree_request(user_text: str) -> Optional[Dict[str, str]]:
+    txt = (user_text or "").strip()
+    if not txt:
+        return None
+    low = txt.lower()
+    if not any(x in low for x in ["mapeie a árvore", "map the tree", "árvore do", "tree of"]):
+        return None
+    root_path = ""
+    m = re.search(r"(?:árvore\s+do|tree\s+of|mapeie\s+a\s+árvore\s+do)\s+([A-Za-z0-9._/\-]{1,120})", txt, flags=re.IGNORECASE)
+    if m:
+        root_path = str(m.group(1) or "").strip()
+        if root_path in {"backend", "api"}:
+            root_path = "app"
+        elif root_path in {"frontend", "web"}:
+            root_path = "src"
+    return {"root_path": root_path, "branch": _github_extract_branch_from_text(txt)}
+
+
+def _github_extract_search_request(user_text: str) -> Optional[Dict[str, str]]:
+    txt = (user_text or "").strip()
+    if not txt:
+        return None
+    query = ""
+    patterns = [
+        r"busque\s+no\s+c[oó]digo\s+por\s+(.+)$",
+        r"search\s+the\s+code\s+for\s+(.+)$",
+        r"procure\s+no\s+c[oó]digo\s+por\s+(.+)$",
+    ]
+    for pat in patterns:
+        m = re.search(pat, txt, flags=re.IGNORECASE | re.DOTALL)
+        if m:
+            query = str(m.group(1) or "").strip().strip("`'\"")
+            break
+    if not query:
+        return None
+    return {"query": query, "branch": _github_extract_branch_from_text(txt)}
+
+
+def _github_extract_code_context_request(user_text: str) -> Optional[Dict[str, Any]]:
+    txt = (user_text or "").strip()
+    if not txt:
+        return None
+    low = txt.lower()
+    if not any(x in low for x in ["monte contexto técnico", "build code context", "contexto técnico"]):
+        return None
+    branch = _github_extract_branch_from_text(txt)
+    paths = re.findall(r"([A-Za-z0-9_./\-]+\.(?:py|ts|tsx|js|jsx|json|md|yml|yaml))", txt, flags=re.IGNORECASE)
+    unique_paths = []
+    for p in paths:
+        p = str(p or "").strip()
+        if p and p not in unique_paths:
+            unique_paths.append(p)
+    query = ""
+    m = re.search(r"(?:fluxo|flow|contexto\s+t[ée]cnico\s+do)\s+(.+)$", txt, flags=re.IGNORECASE)
+    if m:
+        query = str(m.group(1) or "").strip()
+    return {"paths": unique_paths[:_GITHUB_MULTI_READ_LIMIT], "query": query, "branch": branch}
+
+
+def _github_extract_repo_audit_request(user_text: str) -> Optional[Dict[str, str]]:
+    txt = (user_text or "").strip()
+    if not txt:
+        return None
+    low = txt.lower()
+    if not any(x in low for x in ["audite o backend", "audite o frontend", "audit the backend", "audit the frontend", "audite o repositório", "audit the repository", "audite a plataforma"]):
+        return None
+    return {"scope": _github_guess_scope_from_text(txt), "branch": _github_extract_branch_from_text(txt)}
+
+
+def _github_extract_module_audit_request(user_text: str) -> Optional[Dict[str, str]]:
+    txt = (user_text or "").strip()
+    if not txt:
+        return None
+    low = txt.lower()
+    if not any(x in low for x in ["audite o módulo", "audit module", "audite o fluxo", "audit flow"]):
+        return None
+    return {"module_name": _github_guess_module_name(txt), "branch": _github_extract_branch_from_text(txt)}
+
+
+def _github_get_file_content_capability(*, path: str, branch: Optional[str] = None, trace_id: Optional[str] = None) -> Dict[str, Any]:
+    repo, resolved_branch, token = _github_resolve_repo_branch(branch)
+    if not token or not repo:
+        return {"handled": True, "success": False, "provider": "github", "message": "GitHub capability não está habilitada no ambiente."}
+    if not _github_safe_path(path):
+        return {"handled": True, "success": False, "provider": "github", "message": "O caminho solicitado para leitura não é seguro."}
+    _github_log("GITHUB_FILE_READ_ATTEMPT", repo=repo, branch=resolved_branch, path=path, trace_id=trace_id or "")
+    result = _github_read_file_via_contents(repo, resolved_branch, path)
+    if not result.get("ok"):
+        return {"handled": True, "success": False, "provider": "github", "repo": repo, "branch": resolved_branch, "path": path, "message": str(result.get("message") or "Falha ao ler arquivo no GitHub.")}
+    _github_log("GITHUB_FILE_READ_OK", repo=repo, branch=resolved_branch, path=path, trace_id=trace_id or "")
+    return {
+        "handled": True,
+        "success": True,
+        "provider": "github",
+        "event": "GITHUB_FILE_READ_OK",
+        "repo": repo,
+        "branch": resolved_branch,
+        "path": path,
+        "size_bytes": result.get("size_bytes"),
+        "sha": result.get("sha"),
+        "content_excerpt": result.get("content_excerpt"),
+        "truncated": bool(result.get("truncated")),
+        "message": "Leitura de arquivo realizada com evidência operacional.",
+    }
+
+
+def _github_read_multiple_files_capability(*, paths: List[str], branch: Optional[str] = None, trace_id: Optional[str] = None) -> Dict[str, Any]:
+    repo, resolved_branch, token = _github_resolve_repo_branch(branch)
+    if not token or not repo:
+        return {"handled": True, "success": False, "provider": "github", "message": "GitHub capability não está habilitada no ambiente."}
+    normalized_paths = []
+    for p in paths or []:
+        p = str(p or "").strip()
+        if p and _github_safe_path(p) and p not in normalized_paths:
+            normalized_paths.append(p)
+    normalized_paths = normalized_paths[:_GITHUB_MULTI_READ_LIMIT]
+    if not normalized_paths:
+        return {"handled": True, "success": False, "provider": "github", "message": "Nenhum arquivo válido foi informado para leitura múltipla."}
+    _github_log("GITHUB_MULTI_READ_ATTEMPT", repo=repo, branch=resolved_branch, files_count=len(normalized_paths), trace_id=trace_id or "")
+    excerpts = []
+    files_read = []
+    missing_files = []
+    for p in normalized_paths:
+        item = _github_read_file_via_contents(repo, resolved_branch, p)
+        if item.get("ok"):
+            files_read.append(p)
+            excerpts.append({
+                "path": p,
+                "sha": item.get("sha"),
+                "size_bytes": item.get("size_bytes"),
+                "content_excerpt": item.get("content_excerpt"),
+                "truncated": bool(item.get("truncated")),
+            })
+        else:
+            missing_files.append(p)
+    if not files_read:
+        return {"handled": True, "success": False, "provider": "github", "repo": repo, "branch": resolved_branch, "message": "Nenhum dos arquivos solicitados pôde ser lido no GitHub."}
+    _github_log("GITHUB_MULTI_READ_OK", repo=repo, branch=resolved_branch, files_count=len(files_read), missing_count=len(missing_files), trace_id=trace_id or "")
+    return {
+        "handled": True,
+        "success": True,
+        "provider": "github",
+        "event": "GITHUB_MULTI_READ_OK",
+        "repo": repo,
+        "branch": resolved_branch,
+        "files_read": files_read,
+        "missing_files": missing_files,
+        "excerpts": excerpts,
+        "message": "Leitura múltipla concluída com evidência operacional.",
+    }
+
+
+def _github_read_tree_recursive_capability(*, root_path: str = "", branch: Optional[str] = None, trace_id: Optional[str] = None) -> Dict[str, Any]:
+    repo, resolved_branch, token = _github_resolve_repo_branch(branch)
+    if not token or not repo:
+        return {"handled": True, "success": False, "provider": "github", "message": "GitHub capability não está habilitada no ambiente."}
+    _github_log("GITHUB_TREE_READ_ATTEMPT", repo=repo, branch=resolved_branch, root_path=root_path or "", trace_id=trace_id or "")
+    tree = _github_tree_recursive(repo, resolved_branch, root_path or "")
+    if not tree.get("ok"):
+        return {"handled": True, "success": False, "provider": "github", "repo": repo, "branch": resolved_branch, "root_path": root_path or "", "message": str(tree.get("message") or "Falha ao ler árvore do repositório.")}
+    _github_log("GITHUB_TREE_READ_OK", repo=repo, branch=resolved_branch, root_path=root_path or "", total_entries=tree.get("total_entries"), trace_id=trace_id or "")
+    return {
+        "handled": True,
+        "success": True,
+        "provider": "github",
+        "event": "GITHUB_TREE_READ_OK",
+        "repo": repo,
+        "branch": resolved_branch,
+        "root_path": tree.get("root_path") or "",
+        "total_entries": tree.get("total_entries") or 0,
+        "files": list(tree.get("files") or []),
+        "dirs": list(tree.get("dirs") or []),
+        "message": "Árvore recursiva lida com evidência operacional.",
+    }
+
+
+def _github_search_code_capability(*, query: str, branch: Optional[str] = None, trace_id: Optional[str] = None) -> Dict[str, Any]:
+    repo, resolved_branch, token = _github_resolve_repo_branch(branch)
+    if not token or not repo:
+        return {"handled": True, "success": False, "provider": "github", "message": "GitHub capability não está habilitada no ambiente."}
+    q = (query or "").strip()
+    if not q:
+        return {"handled": True, "success": False, "provider": "github", "message": "Informe um termo válido para busca no código."}
+    _github_log("GITHUB_CODE_SEARCH_ATTEMPT", repo=repo, branch=resolved_branch, query=q, trace_id=trace_id or "")
+    tree = _github_tree_recursive(repo, resolved_branch, "")
+    if not tree.get("ok"):
+        return {"handled": True, "success": False, "provider": "github", "repo": repo, "branch": resolved_branch, "query": q, "message": str(tree.get("message") or "Falha ao mapear repositório para busca.")}
+    matched_files = []
+    snippets = []
+    q_low = q.lower()
+    for path in list(tree.get("files") or []):
+        if len(matched_files) >= _GITHUB_SEARCH_FILE_LIMIT or len(snippets) >= _GITHUB_SEARCH_SNIPPET_LIMIT:
+            break
+        if not _github_should_read_file(path):
+            continue
+        item = _github_read_file_via_contents(repo, resolved_branch, path, max_chars=max(_GITHUB_READ_FILE_MAX_CHARS, 18000))
+        if not item.get("ok"):
+            continue
+        content = str(item.get("content") or "")
+        low = content.lower()
+        if q_low not in low:
+            continue
+        matched_files.append(path)
+        lines = content.splitlines()
+        for i, line in enumerate(lines, start=1):
+            if q_low in line.lower():
+                start = max(1, i - 2)
+                end = min(len(lines), i + 2)
+                block = "\n".join(lines[start - 1:end])
+                snippets.append({"path": path, "line": i, "snippet": block})
+                if len(snippets) >= _GITHUB_SEARCH_SNIPPET_LIMIT:
+                    break
+    if not matched_files:
+        return {"handled": True, "success": False, "provider": "github", "repo": repo, "branch": resolved_branch, "query": q, "message": "Nenhuma ocorrência foi encontrada no código com leitura real dos arquivos analisados."}
+    _github_log("GITHUB_CODE_SEARCH_OK", repo=repo, branch=resolved_branch, query=q, matched_files=len(matched_files), snippets=len(snippets), trace_id=trace_id or "")
+    return {
+        "handled": True,
+        "success": True,
+        "provider": "github",
+        "event": "GITHUB_CODE_SEARCH_OK",
+        "repo": repo,
+        "branch": resolved_branch,
+        "query": q,
+        "matched_files": matched_files,
+        "snippets": snippets,
+        "message": "Busca de código concluída com evidência operacional.",
+    }
+
+
+def _github_build_code_context_capability(*, paths: Optional[List[str]] = None, query: Optional[str] = None, branch: Optional[str] = None, trace_id: Optional[str] = None) -> Dict[str, Any]:
+    repo, resolved_branch, token = _github_resolve_repo_branch(branch)
+    if not token or not repo:
+        return {"handled": True, "success": False, "provider": "github", "message": "GitHub capability não está habilitada no ambiente."}
+    normalized_paths = []
+    for p in paths or []:
+        p = str(p or "").strip()
+        if p and _github_safe_path(p) and p not in normalized_paths:
+            normalized_paths.append(p)
+    excerpts = []
+    files_read = []
+    related_modules = []
+    key_functions = []
+    if normalized_paths:
+        multi = _github_read_multiple_files_capability(paths=normalized_paths, branch=resolved_branch, trace_id=trace_id)
+        if multi.get("success"):
+            excerpts = list(multi.get("excerpts") or [])
+            files_read = list(multi.get("files_read") or [])
+    search_res = None
+    if query:
+        search_res = _github_search_code_capability(query=query, branch=resolved_branch, trace_id=trace_id)
+        if search_res.get("success"):
+            for path in list(search_res.get("matched_files") or []):
+                if path not in files_read:
+                    files_read.append(path)
+    for item in excerpts:
+        excerpt = str((item or {}).get("content_excerpt") or "")
+        for fn in re.findall(r"\bdef\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", excerpt):
+            if fn not in key_functions:
+                key_functions.append(fn)
+        for fn in re.findall(r"\basync\s+def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", excerpt):
+            if fn not in key_functions:
+                key_functions.append(fn)
+    for path in files_read:
+        parent = path.rsplit("/", 1)[0] if "/" in path else ""
+        if parent and parent not in related_modules:
+            related_modules.append(parent)
+    risk_points = []
+    if any(str(p).endswith("main.py") for p in files_read):
+        risk_points.append("long main module")
+    if len(files_read) >= 3:
+        risk_points.append("cross-file coupling")
+    if search_res and search_res.get("success") and len(list(search_res.get("matched_files") or [])) >= 5:
+        risk_points.append("broad impact surface")
+    technical_summary = "Contexto técnico montado com leitura real do repositório."
+    _github_log("GITHUB_CODE_CONTEXT_OK", repo=repo, branch=resolved_branch, files=len(files_read), functions=len(key_functions), trace_id=trace_id or "")
+    return {
+        "handled": True,
+        "success": True,
+        "provider": "github",
+        "event": "GITHUB_CODE_CONTEXT_OK",
+        "repo": repo,
+        "branch": resolved_branch,
+        "key_files": files_read[:20],
+        "key_functions": key_functions[:40],
+        "related_modules": related_modules[:20],
+        "risk_points": risk_points[:20],
+        "technical_summary": technical_summary,
+        "excerpts": excerpts[:8],
+        "snippets": list(search_res.get("snippets") or [])[:8] if isinstance(search_res, dict) else [],
+        "message": "Contexto técnico montado com evidência operacional.",
+    }
+
+
+def _github_repo_audit_scan_capability(*, scope: str = "repo", branch: Optional[str] = None, trace_id: Optional[str] = None) -> Dict[str, Any]:
+    repo, resolved_branch, token = _github_resolve_repo_branch(branch)
+    if not token or not repo:
+        return {"handled": True, "success": False, "provider": "github", "message": "GitHub capability não está habilitada no ambiente."}
+    resolved_scope = (scope or "repo").strip().lower() or "repo"
+    root_map = {"backend": "app", "frontend": "src", "repo": ""}
+    root_path = root_map.get(resolved_scope, "")
+    _github_log("GITHUB_REPO_AUDIT_ATTEMPT", repo=repo, branch=resolved_branch, scope=resolved_scope, trace_id=trace_id or "")
+    tree = _github_tree_recursive(repo, resolved_branch, root_path)
+    if not tree.get("ok"):
+        return {"handled": True, "success": False, "provider": "github", "repo": repo, "branch": resolved_branch, "scope": resolved_scope, "message": str(tree.get("message") or "Falha ao mapear escopo da auditoria.")}
+    files = list(tree.get("files") or [])
+    candidate_files = []
+    for path in files:
+        low = path.lower()
+        if not _github_should_read_file(path):
+            continue
+        if any(low.endswith(suf) for suf in [".py", ".ts", ".tsx", ".js", ".jsx", ".json", ".yml", ".yaml"]):
+            candidate_files.append(path)
+    preferred = []
+    pref_patterns = ["main.py", "runtime.py", "db.py", "models.py", "api.js", "appconsole", "server.cjs", "routes/"]
+    for p in candidate_files:
+        low = p.lower()
+        if any(pp in low for pp in pref_patterns):
+            preferred.append(p)
+    selected = []
+    for p in preferred + candidate_files:
+        if p not in selected:
+            selected.append(p)
+        if len(selected) >= 8:
+            break
+    multi = _github_read_multiple_files_capability(paths=selected, branch=resolved_branch, trace_id=trace_id)
+    if not multi.get("success"):
+        return {"handled": True, "success": False, "provider": "github", "repo": repo, "branch": resolved_branch, "scope": resolved_scope, "message": "Não foi possível obter leitura suficiente dos arquivos para auditoria baseada em evidência."}
+    findings = []
+    risks = []
+    for item in list(multi.get("excerpts") or []):
+        path = str((item or {}).get("path") or "").strip()
+        excerpt = str((item or {}).get("content_excerpt") or "")
+        if path.endswith("main.py") and len(excerpt) > 6000:
+            findings.append({"severity": "MEDIO", "title": f"{path} concentra muita lógica", "detail": "Arquivo principal extenso, com múltiplas responsabilidades misturadas."})
+            risks.append("mixed concerns in main module")
+        if "GITHUB_TOKEN" in excerpt or "OPENAI_API_KEY" in excerpt:
+            findings.append({"severity": "MEDIO", "title": f"{path} toca segredos de ambiente", "detail": "Há acoplamento explícito com variáveis sensíveis; revisar exposição e logging."})
+            risks.append("secrets handling surface")
+        if "def _openai_answer" in excerpt or "asyncio.create_task" in excerpt:
+            findings.append({"severity": "BAIXO", "title": f"{path} participa do fluxo crítico de resposta", "detail": "Arquivo participa da trilha síncrona/assíncrona principal e merece cobertura especial."})
+    if not findings:
+        findings.append({"severity": "BAIXO", "title": "Leitura concluída sem achado crítico automático", "detail": "A auditoria foi baseada apenas nos arquivos lidos neste ciclo."})
+    suggested_actions = [
+        "validar os achados contra os arquivos completos antes de alterar fluxos críticos",
+        "priorizar módulos com maior concentração de responsabilidade",
+        "usar o contexto multiarquivo antes de propor patch"
+    ]
+    confidence = 0.84 if len(list(multi.get("files_read") or [])) >= 4 else 0.72
+    _github_log("GITHUB_REPO_AUDIT_OK", repo=repo, branch=resolved_branch, scope=resolved_scope, findings=len(findings), trace_id=trace_id or "")
+    return {
+        "handled": True,
+        "success": True,
+        "provider": "github",
+        "event": "GITHUB_REPO_AUDIT_OK",
+        "repo": repo,
+        "branch": resolved_branch,
+        "scope": resolved_scope,
+        "files_analyzed": list(multi.get("files_read") or []),
+        "findings": findings,
+        "risks": risks[:20],
+        "suggested_actions": suggested_actions,
+        "confidence": confidence,
+        "message": "Auditoria ampla concluída com base em leitura real.",
+    }
+
+
+def _github_module_audit_capability(*, module_name: str, branch: Optional[str] = None, trace_id: Optional[str] = None) -> Dict[str, Any]:
+    repo, resolved_branch, token = _github_resolve_repo_branch(branch)
+    if not token or not repo:
+        return {"handled": True, "success": False, "provider": "github", "message": "GitHub capability não está habilitada no ambiente."}
+    module = (module_name or "").strip().strip("/")
+    if not module:
+        return {"handled": True, "success": False, "provider": "github", "message": "Informe um módulo válido para auditoria."}
+    tree = _github_tree_recursive(repo, resolved_branch, "")
+    if not tree.get("ok"):
+        return {"handled": True, "success": False, "provider": "github", "repo": repo, "branch": resolved_branch, "module_name": module, "message": str(tree.get("message") or "Falha ao mapear repositório para auditoria modular.")}
+    relevant_files = []
+    module_low = module.lower()
+    for path in list(tree.get("files") or []):
+        low = path.lower()
+        if module_low in low and _github_should_read_file(path):
+            relevant_files.append(path)
+        if len(relevant_files) >= 8:
+            break
+    if not relevant_files:
+        search_res = _github_search_code_capability(query=module, branch=resolved_branch, trace_id=trace_id)
+        if search_res.get("success"):
+            relevant_files = list(search_res.get("matched_files") or [])[:8]
+    if not relevant_files:
+        return {"handled": True, "success": False, "provider": "github", "repo": repo, "branch": resolved_branch, "module_name": module, "message": "Nenhum arquivo relevante foi localizado para a auditoria modular."}
+    multi = _github_read_multiple_files_capability(paths=relevant_files, branch=resolved_branch, trace_id=trace_id)
+    if not multi.get("success"):
+        return {"handled": True, "success": False, "provider": "github", "repo": repo, "branch": resolved_branch, "module_name": module, "message": "Não foi possível ler os arquivos relevantes do módulo."}
+    findings = []
+    architecture_notes = []
+    remediation_plan = []
+    for item in list(multi.get("excerpts") or []):
+        path = str((item or {}).get("path") or "").strip()
+        excerpt = str((item or {}).get("content_excerpt") or "")
+        if "TODO" in excerpt or "FIXME" in excerpt:
+            findings.append({"severity": "MEDIO", "title": f"{path} contém marcadores pendentes", "detail": "Foram encontrados TODO/FIXME no trecho lido do módulo."})
+        if "class " in excerpt or "def " in excerpt or "async def " in excerpt:
+            architecture_notes.append(f"{path} expõe superfície funcional relevante no módulo auditado.")
+    remediation_plan.extend([
+        "consolidar leitura dos arquivos centrais do módulo antes de gerar patch",
+        "mapear dependências de entrada e saída do módulo auditado",
+        "validar riscos transversais com busca por código"
+    ])
+    _github_log("GITHUB_MODULE_AUDIT_OK", repo=repo, branch=resolved_branch, module_name=module, files=len(list(multi.get("files_read") or [])), trace_id=trace_id or "")
+    return {
+        "handled": True,
+        "success": True,
+        "provider": "github",
+        "event": "GITHUB_MODULE_AUDIT_OK",
+        "repo": repo,
+        "branch": resolved_branch,
+        "module_name": module,
+        "relevant_files": list(multi.get("files_read") or []),
+        "findings": findings,
+        "architecture_notes": architecture_notes[:20],
+        "remediation_plan": remediation_plan[:20],
+        "message": "Auditoria modular concluída com evidência operacional.",
+    }
+
     if not token or not repo:
         return {
             "handled": True,
@@ -5244,7 +6010,65 @@ def _github_create_pull_request_capability(*, head: str, base: str, title: str, 
     _github_log("GITHUB_PR_VERIFY_OK", repo=repo, head=head, base=base, number=number, trace_id=trace_id or "")
     return {"handled": True, "success": True, "provider": "github", "repo": repo, "branch": head, "base_branch": base, "pull_request_number": number, "pull_request_url": html_url, "title": pr_title, "message": "Pull request criado com confirmação operacional verificável."}
 
+
 def _execute_capability_if_authorized(user_text: str, *, trace_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    req_read = _github_extract_read_file_request(user_text)
+    if req_read:
+        return _github_get_file_content_capability(
+            path=str(req_read.get("path") or "").strip(),
+            branch=str(req_read.get("branch") or "").strip() or None,
+            trace_id=trace_id,
+        )
+
+    req_multi = _github_extract_multiple_files_request(user_text)
+    if req_multi:
+        return _github_read_multiple_files_capability(
+            paths=list(req_multi.get("paths") or []),
+            branch=str(req_multi.get("branch") or "").strip() or None,
+            trace_id=trace_id,
+        )
+
+    req_tree = _github_extract_tree_request(user_text)
+    if req_tree:
+        return _github_read_tree_recursive_capability(
+            root_path=str(req_tree.get("root_path") or "").strip(),
+            branch=str(req_tree.get("branch") or "").strip() or None,
+            trace_id=trace_id,
+        )
+
+    req_search = _github_extract_search_request(user_text)
+    if req_search:
+        return _github_search_code_capability(
+            query=str(req_search.get("query") or "").strip(),
+            branch=str(req_search.get("branch") or "").strip() or None,
+            trace_id=trace_id,
+        )
+
+    req_context = _github_extract_code_context_request(user_text)
+    if req_context:
+        return _github_build_code_context_capability(
+            paths=list(req_context.get("paths") or []),
+            query=str(req_context.get("query") or "").strip() or None,
+            branch=str(req_context.get("branch") or "").strip() or None,
+            trace_id=trace_id,
+        )
+
+    req_repo_audit = _github_extract_repo_audit_request(user_text)
+    if req_repo_audit:
+        return _github_repo_audit_scan_capability(
+            scope=str(req_repo_audit.get("scope") or "repo").strip() or "repo",
+            branch=str(req_repo_audit.get("branch") or "").strip() or None,
+            trace_id=trace_id,
+        )
+
+    req_module_audit = _github_extract_module_audit_request(user_text)
+    if req_module_audit:
+        return _github_module_audit_capability(
+            module_name=str(req_module_audit.get("module_name") or "").strip(),
+            branch=str(req_module_audit.get("branch") or "").strip() or None,
+            trace_id=trace_id,
+        )
+
     req_batch = _extract_github_batch_update_request(user_text)
     if req_batch:
         if req_batch.get("invalid") == "unsafe_path":
