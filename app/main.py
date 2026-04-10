@@ -2993,18 +2993,24 @@ def public_chat(inp: PublicChatIn, x_org_slug: Optional[str] = Header(default=No
         )
 
     # Store assistant message
+    m_bot_id = new_id()
+    m_bot_created_at = now_ts()
     m_bot = Message(
-        id=new_id(),
+        id=m_bot_id,
         org_slug=org,
         thread_id=tid,
         role="assistant",
         content=reply_text,
-        created_at=now_ts(),
+        created_at=m_bot_created_at,
         agent_id=(orkio.id if orkio else None),
         agent_name=(orkio.name if orkio else "Orkio"),
     )
     db.add(m_bot)
     db.commit()
+    try:
+        db.refresh(m_bot)
+    except Exception:
+        pass
     # Record cost event (public chat) — estimated tokens + PricingRegistry
     try:
         provider = "openai"
@@ -3025,7 +3031,7 @@ def public_chat(inp: PublicChatIn, x_org_slug: Optional[str] = Header(default=No
             org_slug=org,
             user_id=None,
             thread_id=tid,
-            message_id=m_bot.id,
+            message_id=m_bot_id,
             agent_id=(orkio.id if orkio else None),
             provider=provider,
             model=model_name,
@@ -6678,25 +6684,31 @@ async def chat_stream(
 
                 # Persist assistant message (DB path can fail; must rollback)
                 try:
+                    m_ass_id = new_id()
+                    m_ass_created_at = now_ts()
                     m_ass = Message(
-                        id=new_id(),
+                        id=m_ass_id,
                         org_slug=org,
                         thread_id=tid,
                         role="assistant",
                         content=ans,
                         agent_id=ag_id,
                         agent_name=ag_name,
-                        created_at=now_ts(),
+                        created_at=m_ass_created_at,
                     )
                     db.add(m_ass)
                     db.commit()
+                    try:
+                        db.refresh(m_ass)
+                    except Exception:
+                        pass
                     try:
                         _track_cost(
                             db=db,
                             org=org,
                             uid=uid,
                             tid=tid,
-                            message_id=m_ass.id,
+                            message_id=m_ass_id,
                             agent=type("StreamAgentProxy", (), {"id": ag_id, "name": ag_name})(),
                             ans_obj=ans_obj,
                             user_msg=user_msg if blocked_reply is None else blocked_reply,
