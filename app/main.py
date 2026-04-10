@@ -4159,6 +4159,113 @@ def _build_agent_prompt(agent, inp_message: str, has_team: bool, mention_tokens:
     return inp_message or ""
 
 
+
+def _ensure_cost_events_schema_runtime(db: Session) -> None:
+    """Best-effort runtime reconciliation for cost_events schema drift."""
+    try:
+        db.execute(text("""
+        CREATE TABLE IF NOT EXISTS cost_events (
+            id VARCHAR PRIMARY KEY,
+            org_slug VARCHAR NOT NULL,
+            user_id VARCHAR NULL,
+            thread_id VARCHAR NULL,
+            message_id VARCHAR NULL,
+            agent_id VARCHAR NULL,
+            provider VARCHAR NULL,
+            model VARCHAR NULL,
+            prompt_tokens INTEGER NOT NULL DEFAULT 0,
+            completion_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0,
+            input_cost_usd NUMERIC(12,6) NOT NULL DEFAULT 0,
+            output_cost_usd NUMERIC(12,6) NOT NULL DEFAULT 0,
+            total_cost_usd NUMERIC(12,6) NOT NULL DEFAULT 0,
+            cost_usd NUMERIC(12,6) NOT NULL DEFAULT 0,
+            pricing_version VARCHAR NOT NULL DEFAULT '2026-02-18',
+            pricing_snapshot TEXT,
+            usage_missing BOOLEAN NOT NULL DEFAULT FALSE,
+            metadata TEXT,
+            created_at BIGINT NOT NULL
+        )
+        """))
+        db.execute(text("ALTER TABLE IF EXISTS cost_events ADD COLUMN IF NOT EXISTS user_id VARCHAR"))
+        db.execute(text("ALTER TABLE IF EXISTS cost_events ADD COLUMN IF NOT EXISTS thread_id VARCHAR"))
+        db.execute(text("ALTER TABLE IF EXISTS cost_events ADD COLUMN IF NOT EXISTS message_id VARCHAR"))
+        db.execute(text("ALTER TABLE IF EXISTS cost_events ADD COLUMN IF NOT EXISTS agent_id VARCHAR"))
+        db.execute(text("ALTER TABLE IF EXISTS cost_events ADD COLUMN IF NOT EXISTS provider VARCHAR"))
+        db.execute(text("ALTER TABLE IF EXISTS cost_events ADD COLUMN IF NOT EXISTS model VARCHAR"))
+        db.execute(text("ALTER TABLE IF EXISTS cost_events ADD COLUMN IF NOT EXISTS prompt_tokens INTEGER NOT NULL DEFAULT 0"))
+        db.execute(text("ALTER TABLE IF EXISTS cost_events ADD COLUMN IF NOT EXISTS completion_tokens INTEGER NOT NULL DEFAULT 0"))
+        db.execute(text("ALTER TABLE IF EXISTS cost_events ADD COLUMN IF NOT EXISTS total_tokens INTEGER NOT NULL DEFAULT 0"))
+        db.execute(text("ALTER TABLE IF EXISTS cost_events ADD COLUMN IF NOT EXISTS input_cost_usd NUMERIC(12,6) NOT NULL DEFAULT 0"))
+        db.execute(text("ALTER TABLE IF EXISTS cost_events ADD COLUMN IF NOT EXISTS output_cost_usd NUMERIC(12,6) NOT NULL DEFAULT 0"))
+        db.execute(text("ALTER TABLE IF EXISTS cost_events ADD COLUMN IF NOT EXISTS total_cost_usd NUMERIC(12,6) NOT NULL DEFAULT 0"))
+        db.execute(text("ALTER TABLE IF EXISTS cost_events ADD COLUMN IF NOT EXISTS cost_usd NUMERIC(12,6) NOT NULL DEFAULT 0"))
+        db.execute(text("ALTER TABLE IF EXISTS cost_events ADD COLUMN IF NOT EXISTS pricing_version VARCHAR NOT NULL DEFAULT '2026-02-18'"))
+        db.execute(text("ALTER TABLE IF EXISTS cost_events ADD COLUMN IF NOT EXISTS pricing_snapshot TEXT"))
+        db.execute(text("ALTER TABLE IF EXISTS cost_events ADD COLUMN IF NOT EXISTS usage_missing BOOLEAN NOT NULL DEFAULT FALSE"))
+        db.execute(text("ALTER TABLE IF EXISTS cost_events ADD COLUMN IF NOT EXISTS metadata TEXT"))
+        db.execute(text("CREATE INDEX IF NOT EXISTS idx_cost_events_org ON cost_events(org_slug)"))
+        db.execute(text("CREATE INDEX IF NOT EXISTS idx_cost_events_created ON cost_events(created_at)"))
+        db.commit()
+        try:
+            logger.info("COST_EVENTS_SCHEMA_RUNTIME_OK")
+        except Exception:
+            pass
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        try:
+            logger.exception("COST_EVENTS_SCHEMA_RUNTIME_FAILED")
+        except Exception:
+            pass
+
+
+def _apply_execution_planner_adjustment(target_agents, adjustment: Optional[Dict[str, Any]]):
+    """Adaptive but conservative reordering based on recent execution telemetry."""
+    try:
+        if not target_agents or len(target_agents) <= 1:
+            return target_agents
+        adjustment = adjustment or {}
+        preferred = str(adjustment.get("preferred_visible_node") or "").strip().lower()
+        avoid_nodes = {str(x).strip().lower() for x in (adjustment.get("avoid_nodes") or []) if str(x).strip()}
+        routing_bias = str(adjustment.get("routing_bias") or "").strip().lower()
+        if not preferred and not avoid_nodes and routing_bias != "allow_adaptive_routing":
+            return target_agents
+
+        def _agent_name(ag: Any) -> str:
+            if isinstance(ag, dict):
+                return str(ag.get("name") or "").strip().lower()
+            return str(getattr(ag, "name", "") or "").strip().lower()
+
+        preferred_bucket = []
+        neutral_bucket = []
+        avoid_bucket = []
+
+        for ag in target_agents:
+            name = _agent_name(ag)
+            first = name.split()[0] if name else ""
+            if preferred and (name == preferred or first == preferred):
+                preferred_bucket.append(ag)
+            elif first in avoid_nodes or name in avoid_nodes:
+                avoid_bucket.append(ag)
+            else:
+                neutral_bucket.append(ag)
+
+        ordered = preferred_bucket + neutral_bucket + avoid_bucket
+        seen = set()
+        out = []
+        for ag in ordered:
+            agid = ag.get("id") if isinstance(ag, dict) else getattr(ag, "id", None)
+            if agid not in seen:
+                out.append(ag)
+                seen.add(agid)
+        return out or target_agents
+    except Exception:
+        return target_agents
+
+
 def _track_cost(
     db: Session,
     org: str,
@@ -4173,7 +4280,7 @@ def _track_cost(
     estimated: bool = False,
 ) -> None:
     """Persiste CostEvent de forma consistente para /api/chat e /api/chat/stream."""
-    try:
+    def _persist_once() -> None:
         provider = "openai"
         usage = (ans_obj.get("usage") if ans_obj else None)
         usage_missing = False
@@ -4229,12 +4336,32 @@ def _track_cost(
             "COST_EVENT_PERSISTED tid=%s agent=%s prompt=%s compl=%s total_usd=%.6f streaming=%s estimated=%s",
             tid, (agent.id if agent else None), prompt_t, completion_t, float(total_usd), streaming, usage_missing or estimated,
         )
-    except Exception:
+
+    try:
+        _persist_once()
+    except Exception as first_err:
         try:
             db.rollback()
         except Exception:
             pass
+        err_txt = str(first_err or "")
+        should_reconcile = ("cost_events" in err_txt.lower()) or ("undefinedcolumn" in first_err.__class__.__name__.lower())
+        if should_reconcile:
+            try:
+                _ensure_cost_events_schema_runtime(db)
+                _persist_once()
+                try:
+                    logger.warning("COST_EVENT_SCHEMA_DRIFT_AUTO_HEALED")
+                except Exception:
+                    pass
+                return
+            except Exception:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
         logger.exception("COST_EVENT_PERSIST_FAILED")
+
 
 
 def _track_execution_event(
@@ -4415,6 +4542,18 @@ def chat(
 
     if runtime_enrichment.get("planner_snapshot") and len(target_agents) > 1:
         target_agents = _reorder_agents_by_planner(target_agents, runtime_enrichment.get("planner_snapshot"))
+    try:
+        recent_execution_rows = _read_recent_execution_events(db, org=org, thread_id=tid, limit=8)
+        execution_review = _build_execution_review_snapshot(recent_execution_rows)
+        planner_adjustment = _build_execution_planner_adjustment(execution_review)
+        target_agents = _apply_execution_planner_adjustment(target_agents, planner_adjustment)
+        runtime_hints_live = runtime_enrichment.get("runtime_hints") if isinstance(runtime_enrichment.get("runtime_hints"), dict) else {}
+        if isinstance(runtime_hints_live, dict):
+            runtime_hints_live["execution_review"] = execution_review
+            runtime_hints_live["planner_adjustment"] = planner_adjustment
+            runtime_enrichment["runtime_hints"] = runtime_hints_live
+    except Exception:
+        pass
     try:
         dag_snapshot = runtime_enrichment.get("dag_snapshot") or {}
         if dag_snapshot.get("route_applied"):
@@ -6592,7 +6731,7 @@ def _build_execution_planner_adjustment(review: Dict[str, Any]) -> Dict[str, Any
         "latency_mode": latency_mode,
         "routing_bias": routing_bias,
         "confidence_floor": 0.58 if avoid_nodes else 0.52,
-        "source": "execution_review_v7",
+        "source": "execution_review_v8",
     }
 
 @app.post("/api/chat/stream")
@@ -6781,6 +6920,18 @@ async def chat_stream(
 
     if runtime_enrichment.get("planner_snapshot") and len(target_agents) > 1:
         target_agents = _reorder_agents_by_planner(target_agents, runtime_enrichment.get("planner_snapshot"))
+    try:
+        recent_execution_rows = _read_recent_execution_events(db, org=org, thread_id=tid, limit=8)
+        execution_review = _build_execution_review_snapshot(recent_execution_rows)
+        planner_adjustment = _build_execution_planner_adjustment(execution_review)
+        target_agents = _apply_execution_planner_adjustment(target_agents, planner_adjustment)
+        runtime_hints_live = runtime_enrichment.get("runtime_hints") if isinstance(runtime_enrichment.get("runtime_hints"), dict) else {}
+        if isinstance(runtime_hints_live, dict):
+            runtime_hints_live["execution_review"] = execution_review
+            runtime_hints_live["planner_adjustment"] = planner_adjustment
+            runtime_enrichment["runtime_hints"] = runtime_hints_live
+    except Exception:
+        pass
     try:
         dag_snapshot = runtime_enrichment.get("dag_snapshot") or {}
         if dag_snapshot.get("route_applied"):
