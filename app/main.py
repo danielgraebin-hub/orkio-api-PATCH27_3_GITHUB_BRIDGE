@@ -4501,6 +4501,21 @@ def _github_api_json(method: str, url: str, payload: Optional[Dict[str, Any]] = 
         return int(status), parsed
 
 
+
+def _github_log(event: str, **fields: Any) -> None:
+    try:
+        extras = " ".join(f"{k}={fields.get(k)!r}" for k in sorted(fields.keys()))
+        print(f"{event} {extras}".strip())
+    except Exception:
+        pass
+
+def _github_verify_file_exists(repo: str, branch: str, path: str) -> tuple[bool, str, Dict[str, Any]]:
+    verify_url = f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}"
+    status_verify, body_verify = _github_api_json("GET", verify_url, None)
+    returned_path = ((body_verify or {}).get("path") or "").strip()
+    verified = status_verify == 200 and returned_path == path
+    return verified, returned_path, body_verify or {}
+
 def _extract_github_create_file_request(user_text: str) -> Optional[Dict[str, str]]:
     txt = (user_text or "").strip()
     if not txt:
@@ -4591,6 +4606,7 @@ def _build_execution_result_payload(result: Dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
+
 def _github_create_file_capability(*, path: str, content: str, trace_id: Optional[str] = None) -> Dict[str, Any]:
     repo = _clean_env(os.getenv("GITHUB_REPO", ""))
     branch = _clean_env(os.getenv("GITHUB_BRANCH", "main"), default="main") or "main"
@@ -4606,6 +4622,7 @@ def _github_create_file_capability(*, path: str, content: str, trace_id: Optiona
     get_url = f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}"
     status_get, body_get = _github_api_json("GET", get_url, None)
     if status_get == 200:
+        existing_sha = (((body_get or {}).get("sha") or "").strip())
         return {
             "handled": True,
             "success": False,
@@ -4613,6 +4630,7 @@ def _github_create_file_capability(*, path: str, content: str, trace_id: Optiona
             "repo": repo,
             "branch": branch,
             "path": path,
+            "commit_sha": existing_sha,
             "message": f"O arquivo '{path}' já existe no repositório configurado.",
         }
 
@@ -4622,8 +4640,10 @@ def _github_create_file_capability(*, path: str, content: str, trace_id: Optiona
         "branch": branch,
     }
     put_url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    _github_log("GITHUB_WRITE_ATTEMPT", repo=repo, branch=branch, path=path, trace_id=trace_id or "")
     status_put, body_put = _github_api_json("PUT", put_url, payload)
     if status_put not in (200, 201):
+        _github_log("GITHUB_WRITE_FAILED", repo=repo, branch=branch, path=path, status=status_put, trace_id=trace_id or "")
         return {
             "handled": True,
             "success": False,
@@ -4639,6 +4659,35 @@ def _github_create_file_capability(*, path: str, content: str, trace_id: Optiona
         commit_sha = (((body_put or {}).get("commit") or {}).get("sha") or "").strip()
     except Exception:
         commit_sha = ""
+
+    verified = False
+    verified_path = ""
+    verify_body: Dict[str, Any] = {}
+    for _ in range(3):
+        verified, verified_path, verify_body = _github_verify_file_exists(repo, branch, path)
+        if verified:
+            break
+        try:
+            time.sleep(0.35)
+        except Exception:
+            pass
+
+    if not verified:
+        _github_log("GITHUB_WRITE_VERIFY_FAILED", repo=repo, branch=branch, path=path, status=status_put, trace_id=trace_id or "")
+        return {
+            "handled": True,
+            "success": False,
+            "provider": "github",
+            "repo": repo,
+            "branch": branch,
+            "path": path,
+            "commit_sha": commit_sha,
+            "trace_id": trace_id,
+            "message": f"Solicitação enviada ao GitHub, mas sem confirmação verificável de criação do arquivo '{path}'.",
+        }
+
+    verified_sha = ((verify_body or {}).get("sha") or "").strip() or commit_sha
+    _github_log("GITHUB_WRITE_VERIFY_OK", repo=repo, branch=branch, path=path, sha=verified_sha, trace_id=trace_id or "")
     return {
         "handled": True,
         "success": True,
@@ -4646,11 +4695,18 @@ def _github_create_file_capability(*, path: str, content: str, trace_id: Optiona
         "repo": repo,
         "branch": branch,
         "path": path,
-        "commit_sha": commit_sha,
+        "commit_sha": verified_sha,
         "trace_id": trace_id,
-        "message": "Arquivo criado com confirmação operacional.",
+        "message": "Arquivo criado com confirmação operacional verificável.",
     }
 
+
+def _github_verify_branch_exists(repo: str, branch: str) -> tuple[bool, str, Dict[str, Any]]:
+    verify_url = f"https://api.github.com/repos/{repo}/git/ref/heads/{branch}"
+    status_verify, body_verify = _github_api_json("GET", verify_url, None)
+    ref_value = ((body_verify or {}).get("ref") or "").strip()
+    verified = status_verify == 200 and ref_value.endswith(f"/{branch}")
+    return verified, ref_value, body_verify or {}
 
 
 def _github_create_branch_capability(*, branch: str, trace_id: Optional[str] = None) -> Dict[str, Any]:
@@ -4692,14 +4748,17 @@ def _github_create_branch_capability(*, branch: str, trace_id: Optional[str] = N
         }
 
     exists_url = f"https://api.github.com/repos/{repo}/git/ref/heads/{branch}"
-    status_exists, _body_exists = _github_api_json("GET", exists_url, None)
+    status_exists, body_exists = _github_api_json("GET", exists_url, None)
     if status_exists == 200:
+        existing_sha = ((((body_exists or {}).get("object") or {}).get("sha") or "").strip()) or base_sha
         return {
             "handled": True,
             "success": False,
             "provider": "github",
             "repo": repo,
             "branch": branch,
+            "base_branch": base_branch,
+            "commit_sha": existing_sha,
             "message": f"A branch '{branch}' já existe no repositório configurado.",
         }
 
@@ -4708,31 +4767,61 @@ def _github_create_branch_capability(*, branch: str, trace_id: Optional[str] = N
         "ref": f"refs/heads/{branch}",
         "sha": base_sha,
     }
+    _github_log("GITHUB_BRANCH_ATTEMPT", repo=repo, branch=branch, base_branch=base_branch, base_sha=base_sha, trace_id=trace_id or "")
     status_create, body_create = _github_api_json("POST", create_url, payload)
     if status_create not in (200, 201):
+        _github_log("GITHUB_BRANCH_FAILED", repo=repo, branch=branch, status=status_create, trace_id=trace_id or "")
         return {
             "handled": True,
             "success": False,
             "provider": "github",
             "repo": repo,
             "branch": branch,
-            "message": f"GitHub não confirmou a criação da branch '{branch}' (status {status_create}).",
-            "raw": body_create,
+            "base_branch": base_branch,
+            "commit_sha": base_sha,
+            "message": (body_create.get("message") if isinstance(body_create, dict) else None) or f"Falha ao criar a branch '{branch}' no GitHub.",
         }
 
-    created_ref = ((body_create or {}).get("ref") or "").strip()
-    created_sha = (((body_create or {}).get("object") or {}).get("sha") or "").strip()
+    verified = False
+    verified_ref = ""
+    verify_body: Dict[str, Any] = {}
+    for _ in range(3):
+        verified, verified_ref, verify_body = _github_verify_branch_exists(repo, branch)
+        if verified:
+            break
+        try:
+            time.sleep(0.35)
+        except Exception:
+            pass
+
+    created_sha = ((((verify_body or {}).get("object") or {}).get("sha") or "").strip()) or base_sha
+
+    if not verified:
+        _github_log("GITHUB_BRANCH_VERIFY_FAILED", repo=repo, branch=branch, base_branch=base_branch, trace_id=trace_id or "")
+        return {
+            "handled": True,
+            "success": False,
+            "provider": "github",
+            "repo": repo,
+            "branch": branch,
+            "base_branch": base_branch,
+            "commit_sha": created_sha,
+            "trace_id": trace_id,
+            "message": f"Solicitação enviada ao GitHub, mas sem confirmação verificável de criação da branch '{branch}'.",
+        }
+
+    _github_log("GITHUB_BRANCH_VERIFY_OK", repo=repo, branch=branch, base_branch=base_branch, sha=created_sha, trace_id=trace_id or "")
     return {
         "handled": True,
         "success": True,
         "provider": "github",
         "repo": repo,
-        "base_branch": base_branch,
         "branch": branch,
-        "created_ref": created_ref,
-        "commit_sha": created_sha or base_sha,
+        "base_branch": base_branch,
+        "verified_ref": verified_ref or f"refs/heads/{branch}",
+        "commit_sha": created_sha,
         "trace_id": trace_id,
-        "message": "Branch criada com confirmação operacional.",
+        "message": "Branch criada com confirmação operacional verificável.",
     }
 
 def _execute_capability_if_authorized(user_text: str, *, trace_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
