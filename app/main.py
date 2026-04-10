@@ -4625,7 +4625,7 @@ def _extract_github_update_file_request(user_text: str) -> Optional[Dict[str, st
             break
     if not path:
         return None
-    if path.startswith("/") or ".." in path or "\" in path:
+    if path.startswith("/") or ".." in path or "\\" in path:
         return {"invalid": "unsafe_path"}
     branch = ""
     m_branch = re.search(r"(?:na branch|on branch)[: ]+([A-Za-z0-9._/\-]{1,120})", txt, flags=re.IGNORECASE)
