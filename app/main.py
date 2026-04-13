@@ -4521,19 +4521,23 @@ def _github_verify_file_exists(repo: str, branch: str, path: str) -> tuple[bool,
     verified = status_verify == 200 and returned_path == path
     return verified, returned_path, body_verify or {}
 
+
 def _extract_github_create_file_request(user_text: str) -> Optional[Dict[str, str]]:
     txt = (user_text or "").strip()
     if not txt:
         return None
     low = txt.lower()
-    if "github" not in low:
+    if not any(k in low for k in ("github", "arquivo", "file")):
         return None
 
     patterns = [
-        r"crie um arquivo no github chamado[: ]+([A-Za-z0-9._/\-]{1,120})",
-        r"crie um arquivo chamado[: ]+([A-Za-z0-9._/\-]{1,120}).{0,40}?github",
-        r"crie o arquivo[: ]+([A-Za-z0-9._/\-]{1,120}).{0,40}?github",
-        r"create a file on github called[: ]+([A-Za-z0-9._/\-]{1,120})",
+        r"crie um arquivo no github chamado[: ]+([A-Za-z0-9._/\-]{1,160})",
+        r"crie um arquivo chamado[: ]+([A-Za-z0-9._/\-]{1,160})",
+        r"crie o arquivo[: ]+([A-Za-z0-9._/\-]{1,160})",
+        r"create a file on github called[: ]+([A-Za-z0-9._/\-]{1,160})",
+        r"create file[: ]+([A-Za-z0-9._/\-]{1,160})",
+        r"arquivo [`']?([A-Za-z0-9._/\-]{1,160})[`']?",
+        r"file [`']?([A-Za-z0-9._/\-]{1,160})[`']?",
     ]
     path = ""
     for pat in patterns:
@@ -4542,16 +4546,29 @@ def _extract_github_create_file_request(user_text: str) -> Optional[Dict[str, st
             path = (m.group(1) or "").strip()
             break
     if not path:
+        fenced = re.findall(r"`([^`]+)`", txt)
+        for item in fenced:
+            item = item.strip()
+            if "/" in item or "." in item:
+                path = item
+                break
+    if not path:
         return None
-    if path.startswith("/") or ".." in path or "\\" in path:
+    if path.startswith("/") or ".." in path or "\" in path:
         return {"invalid": "unsafe_path"}
     content = ""
     m_content = re.search(r"(?:conte[uú]do|content)[: ]+(.+)$", txt, flags=re.IGNORECASE | re.DOTALL)
     if m_content:
         content = (m_content.group(1) or "").strip()
     if not content:
+        quoted = re.search(r'com\s+conte[uú]do\s+"([\s\S]+)"', txt, flags=re.IGNORECASE)
+        if quoted:
+            content = (quoted.group(1) or "").strip()
+    if not content:
         content = "created by Orkio GitHub capability\n"
     return {"path": path, "content": content}
+
+def _extract_github_create_file_request(user_text: str) -> Optional[Dict[str, str]]:
 
 
 def _extract_github_create_branch_request(user_text: str) -> Optional[Dict[str, str]]:
@@ -4559,7 +4576,7 @@ def _extract_github_create_branch_request(user_text: str) -> Optional[Dict[str, 
     if not txt:
         return None
     low = txt.lower()
-    if "branch" not in low:
+    if "branch" not in low and "ramo" not in low:
         return None
 
     patterns = [
@@ -4567,6 +4584,7 @@ def _extract_github_create_branch_request(user_text: str) -> Optional[Dict[str, 
         r"crie a branch[: ]+([A-Za-z0-9._/\-]{1,120})",
         r"create a branch called[: ]+([A-Za-z0-9._/\-]{1,120})",
         r"create branch[: ]+([A-Za-z0-9._/\-]{1,120})",
+        r"branch [`']?([A-Za-z0-9._/\-]{1,120})[`']?",
     ]
     branch = ""
     for pat in patterns:
@@ -4577,10 +4595,11 @@ def _extract_github_create_branch_request(user_text: str) -> Optional[Dict[str, 
     if not branch:
         return None
     branch = re.sub(r"^refs/heads/", "", branch.strip())
-    if not branch or branch.startswith("/") or ".." in branch or "\\" in branch or " " in branch:
+    if not branch or branch.startswith("/") or ".." in branch or "\" in branch or " " in branch:
         return {"invalid": "unsafe_branch"}
     return {"branch": branch}
 
+def _extract_github_create_branch_request(user_text: str) -> Optional[Dict[str, str]]:
 
 def _extract_github_list_branches_request(user_text: str) -> bool:
     txt = (user_text or "").strip().lower()
@@ -4601,10 +4620,10 @@ def _extract_github_list_files_request(user_text: str) -> Optional[Dict[str, str
         branch = _clean_env(os.getenv("GITHUB_BRANCH", "main"), default="main") or "main"
     return {"branch": branch}
 
+
 def _extract_github_update_file_request(user_text: str) -> Optional[Dict[str, str]]:
     txt = (user_text or "").strip()
     low = txt.lower()
-    # update requests may omit the word "github" when the repo context is already established
     if not any(k in low for k in [
         "atualize o arquivo",
         "edite o arquivo",
@@ -4612,11 +4631,12 @@ def _extract_github_update_file_request(user_text: str) -> Optional[Dict[str, st
         "update the file",
         "adicione ao arquivo",
         "append to file",
+        "substitua o arquivo",
     ]):
         return None
     patterns = [
-        r"(?:atualize o arquivo|edite o arquivo|adicione ao arquivo)[: ]+([A-Za-z0-9._/\-]{1,160})",
-        r"(?:update file|update the file|append to file)[: ]+([A-Za-z0-9._/\-]{1,160})",
+        r"(?:atualize o arquivo|edite o arquivo|adicione ao arquivo|substitua o arquivo)[: ]+([A-Za-z0-9._/\-]{1,200})",
+        r"(?:update file|update the file|append to file)[: ]+([A-Za-z0-9._/\-]{1,200})",
     ]
     path = ""
     for pat in patterns:
@@ -4625,8 +4645,15 @@ def _extract_github_update_file_request(user_text: str) -> Optional[Dict[str, st
             path = (m.group(1) or "").strip()
             break
     if not path:
+        fenced = re.findall(r"`([^`]+)`", txt)
+        for item in fenced:
+            item = item.strip()
+            if "/" in item or "." in item:
+                path = item
+                break
+    if not path:
         return None
-    if path.startswith("/") or ".." in path or "\\" in path:
+    if path.startswith("/") or ".." in path or "\" in path:
         return {"invalid": "unsafe_path"}
     branch = ""
     m_branch = re.search(r"(?:na branch|on branch)[: ]+([A-Za-z0-9._/\-]{1,120})", txt, flags=re.IGNORECASE)
@@ -4644,11 +4671,18 @@ def _extract_github_update_file_request(user_text: str) -> Optional[Dict[str, st
             content = (m_replace.group(1) or "").strip()
             mode = "replace"
     if not content:
+        quoted = re.search(r'com\s+conte[uú]do\s+"([\s\S]+)"', txt, flags=re.IGNORECASE)
+        if quoted:
+            content = (quoted.group(1) or "").strip()
+            mode = "replace"
+    if not content:
         return {"invalid": "missing_content"}
     payload: Dict[str, str] = {"path": path, "content": content, "mode": mode}
     if branch:
         payload["branch"] = branch
     return payload
+
+def _extract_github_update_file_request(user_text: str) -> Optional[Dict[str, str]]:
 
 def _extract_github_create_pr_request(user_text: str) -> Optional[Dict[str, str]]:
     txt = (user_text or "").strip()
@@ -4738,7 +4772,7 @@ def _build_execution_result_payload(result: Dict[str, Any]) -> str:
     commit_sha = (result.get("commit_sha") or "").strip()
     event = (result.get("event") or "").strip()
 
-    parts = ["Ação executada com confirmação operacional."]
+    parts = ["Ação executada com confirmação operacional verificável."]
     if event:
         parts.append(f"event: {event}")
     if provider:
@@ -4928,6 +4962,10 @@ def _github_create_file_capability(*, path: str, content: str, trace_id: Optiona
     repo = _clean_env(os.getenv("GITHUB_REPO", ""))
     branch = _clean_env(os.getenv("GITHUB_BRANCH", "main"), default="main") or "main"
     token = _clean_env(os.getenv("GITHUB_TOKEN", ""))
+    if not _github_write_runtime_enabled():
+        return {"handled": True, "success": False, "provider": "github", "message": "GitHub write runtime desabilitado por ambiente."}
+    if branch == (_clean_env(os.getenv("GITHUB_BRANCH", "main"), default="main") or "main") and not _github_safe_main_write_allowed():
+        return {"handled": True, "success": False, "provider": "github", "repo": repo, "branch": branch, "path": path, "message": f"Criação direta na branch '{branch}' bloqueada pelo modo safe evolution."}
     if not token or not repo:
         return {
             "handled": True,
@@ -5025,6 +5063,26 @@ def _github_verify_branch_exists(repo: str, branch: str) -> tuple[bool, str, Dic
     verified = status_verify == 200 and ref_value.endswith(f"/{branch}")
     return verified, ref_value, body_verify or {}
 
+
+
+def _github_write_runtime_enabled() -> bool:
+    return _env_bool("GITHUB_AUTOMATION_ALLOWED") and _env_bool("AUTO_CODE_EMISSION_ENABLED")
+
+def _github_pr_runtime_enabled() -> bool:
+    return _env_bool("GITHUB_PR_RUNTIME_ENABLED") and (_env_bool("AUTO_PR_BACKEND_ENABLED") or _env_bool("AUTO_PR_FRONTEND_ENABLED") or _env_bool("AUTO_PR_WRITE_ENABLED"))
+
+def _github_safe_main_write_allowed() -> bool:
+    return _env_bool("ALLOW_GITHUB_MAIN_DIRECT")
+
+def _github_prepare_only_requested(user_text: str) -> bool:
+    low = (user_text or "").lower()
+    return any(k in low for k in ("prepare apenas", "prepare only", "não aplique", "nao aplique", "somente diff", "apenas diff"))
+
+def _github_wants_pr(user_text: str) -> bool:
+    low = (user_text or "").lower()
+    if any(k in low for k in ("sem pr", "não abra pr", "nao abra pr", "without pr")):
+        return False
+    return any(k in low for k in ("pull request", "abrir pr", "abra pr", "open pr", "crie pr", "create pr"))
 
 def _github_create_branch_capability(*, branch: str, trace_id: Optional[str] = None) -> Dict[str, Any]:
     repo = _clean_env(os.getenv("GITHUB_REPO", ""))
@@ -5783,6 +5841,10 @@ def _github_update_file_capability(*, path: str, content: str, branch: Optional[
     repo = _clean_env(os.getenv("GITHUB_REPO", ""))
     branch = (_clean_env(branch or "", default="") or _clean_env(os.getenv("GITHUB_BRANCH", "main"), default="main") or "main")
     token = _clean_env(os.getenv("GITHUB_TOKEN", ""))
+    if not _github_write_runtime_enabled():
+        return {"handled": True, "success": False, "provider": "github", "message": "GitHub write runtime desabilitado por ambiente."}
+    if branch == (_clean_env(os.getenv("GITHUB_BRANCH", "main"), default="main") or "main") and not _github_safe_main_write_allowed():
+        return {"handled": True, "success": False, "provider": "github", "repo": repo, "branch": branch, "path": path, "message": f"Escrita direta na branch '{branch}' bloqueada pelo modo safe evolution."}
     if not token or not repo:
         return {"handled": True, "success": False, "provider": "github", "message": "GitHub capability não está habilitada no ambiente."}
     get_url = f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}"
@@ -5873,6 +5935,10 @@ def _github_commit_batch_capability(*, changes: List[Dict[str, str]], branch: Op
     repo = _clean_env(os.getenv("GITHUB_REPO", ""))
     branch = (_clean_env(branch or "", default="") or _clean_env(os.getenv("GITHUB_BRANCH", "main"), default="main") or "main")
     token = _clean_env(os.getenv("GITHUB_TOKEN", ""))
+    if not _github_write_runtime_enabled():
+        return {"handled": True, "success": False, "provider": "github", "message": "GitHub write runtime desabilitado por ambiente."}
+    if branch == (_clean_env(os.getenv("GITHUB_BRANCH", "main"), default="main") or "main") and not _github_safe_main_write_allowed():
+        return {"handled": True, "success": False, "provider": "github", "repo": repo, "branch": branch, "message": f"Commit direto na branch '{branch}' bloqueado pelo modo safe evolution."}
     if not token or not repo:
         return {"handled": True, "success": False, "provider": "github", "message": "GitHub capability não está habilitada no ambiente."}
     normalized_changes: List[Dict[str, str]] = []
@@ -5972,6 +6038,8 @@ def _github_commit_batch_capability(*, changes: List[Dict[str, str]], branch: Op
 def _github_create_pull_request_capability(*, head: str, base: str, title: str, trace_id: Optional[str] = None) -> Dict[str, Any]:
     repo = _clean_env(os.getenv("GITHUB_REPO", ""))
     token = _clean_env(os.getenv("GITHUB_TOKEN", ""))
+    if not _github_pr_runtime_enabled():
+        return {"handled": True, "success": False, "provider": "github", "message": "GitHub PR runtime desabilitado por ambiente."}
     if not token or not repo:
         return {"handled": True, "success": False, "provider": "github", "message": "GitHub capability não está habilitada no ambiente."}
 
@@ -6075,6 +6143,17 @@ def _execute_capability_if_authorized(user_text: str, *, trace_id: Optional[str]
             return {"handled": True, "success": False, "provider": "github", "message": "Um ou mais caminhos do lote não são seguros."}
         if req_batch.get("invalid") == "missing_changes":
             return {"handled": True, "success": False, "provider": "github", "message": "Informe ao menos um arquivo válido no lote."}
+        if _github_prepare_only_requested(user_text):
+            return {
+                "handled": True,
+                "success": True,
+                "provider": "github",
+                "prepared_only": True,
+                "branch": str(req_batch.get("branch") or "").strip() or None,
+                "files": [c.get("path") for c in list(req_batch.get("changes") or [])],
+                "title": str(req_batch.get("title") or "").strip() or None,
+                "message": "Patch em lote preparado em modo seguro. Nenhuma escrita foi executada."
+            }
         return _github_commit_batch_capability(
             changes=list(req_batch.get("changes") or []),
             branch=str(req_batch.get("branch") or "").strip() or None,
@@ -6111,6 +6190,16 @@ def _execute_capability_if_authorized(user_text: str, *, trace_id: Optional[str]
             return {"handled": True, "success": False, "provider": "github", "message": "O caminho solicitado para o arquivo não é seguro."}
         if req_update.get("invalid") == "missing_content":
             return {"handled": True, "success": False, "provider": "github", "message": "Informe o conteúdo a ser aplicado na atualização."}
+        if _github_prepare_only_requested(user_text):
+            return {
+                "handled": True,
+                "success": True,
+                "provider": "github",
+                "prepared_only": True,
+                "path": str(req_update.get("path") or "").strip(),
+                "branch": str(req_update.get("branch") or "").strip() or None,
+                "message": "Patch preparado em modo seguro. Nenhuma escrita foi executada."
+            }
         return _github_update_file_capability(
             path=str(req_update.get("path") or "").strip(),
             content=str(req_update.get("content") or "").strip(),
