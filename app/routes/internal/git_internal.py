@@ -10,6 +10,29 @@ from pydantic import BaseModel, Field
 
 router = APIRouter(prefix="/api/internal/git", tags=["git-internal"])
 
+def _bool_env(name: str, default: bool = False) -> bool:
+    raw = (os.getenv(name, "true" if default else "false") or "").strip().strip('"').strip("\'").lower()
+    return raw in ("1", "true", "yes", "on")
+
+def _write_enabled() -> bool:
+    return _bool_env("GITHUB_AUTOMATION_ALLOWED", False) and _bool_env("AUTO_CODE_EMISSION_ENABLED", False)
+
+def _pr_enabled() -> bool:
+    return _bool_env("GITHUB_PR_RUNTIME_ENABLED", False) and (_bool_env("AUTO_PR_BACKEND_ENABLED", False) or _bool_env("AUTO_PR_FRONTEND_ENABLED", False) or _bool_env("AUTO_PR_WRITE_ENABLED", False))
+
+def _safe_main_write_allowed() -> bool:
+    return _bool_env("ALLOW_GITHUB_MAIN_DIRECT", False)
+
+def _ensure_write_enabled() -> None:
+    if not _write_enabled():
+        raise HTTPException(status_code=403, detail="GitHub write runtime disabled by environment")
+
+def _guard_branch_write(branch: str) -> None:
+    resolved = (branch or "").strip()
+    default_branch = _env("GITHUB_BRANCH", "main")
+    if resolved == default_branch and not _safe_main_write_allowed():
+        raise HTTPException(status_code=403, detail=f"Direct write on '{default_branch}' blocked by safe evolution policy")
+
 
 def _env(name: str, default: str = "") -> str:
     return (os.getenv(name, default) or "").strip().strip('"').strip("'")
@@ -196,6 +219,7 @@ def git_search(
 
 @router.post("/branch")
 def git_create_branch(payload: BranchCreateIn):
+    _ensure_write_enabled()
     source_branch = _branch(payload.source_branch)
     base_sha = _get_ref_sha(source_branch)
     ref = f"refs/heads/{payload.branch_name}"
@@ -220,7 +244,9 @@ def git_create_branch(payload: BranchCreateIn):
 
 @router.post("/commit")
 def git_commit_file(payload: CommitFileIn):
+    _ensure_write_enabled()
     branch_name = _branch(payload.branch)
+    _guard_branch_write(branch_name)
 
     existing_sha = None
     file_preexisted = False
@@ -270,6 +296,8 @@ def git_commit_file(payload: CommitFileIn):
 
 @router.post("/pr")
 def git_open_pr(payload: PullRequestIn):
+    if not _pr_enabled():
+        raise HTTPException(status_code=403, detail="GitHub PR runtime disabled by environment")
     base_branch = _branch(payload.base)
     data = _request(
         "POST",
@@ -286,4 +314,18 @@ def git_open_pr(payload: PullRequestIn):
         "number": data.get("number"),
         "state": data.get("state"),
         "url": data.get("html_url"),
+    }
+
+
+@router.get("/capabilities")
+def git_capabilities():
+    return {
+        "ok": True,
+        "service": "git_internal",
+        "repo": _env("GITHUB_REPO"),
+        "default_branch": _env("GITHUB_BRANCH", "main"),
+        "token_configured": bool(_env("GITHUB_TOKEN")),
+        "write_enabled": _write_enabled(),
+        "pr_enabled": _pr_enabled(),
+        "main_direct_write_allowed": _safe_main_write_allowed(),
     }
