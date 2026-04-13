@@ -24,6 +24,19 @@ from .git_internal import (
 
 router = APIRouter(prefix="/api/internal/orion", tags=["orion-internal"])
 
+def _bool_env(name: str, default: bool = False) -> bool:
+    raw = (os.getenv(name, "true" if default else "false") or "").strip().strip('"').strip("\'").lower()
+    return raw in ("1", "true", "yes", "on")
+
+def _safe_write_runtime_enabled() -> bool:
+    return _bool_env("GITHUB_AUTOMATION_ALLOWED", False) and _bool_env("AUTO_CODE_EMISSION_ENABLED", False)
+
+def _safe_pr_runtime_enabled() -> bool:
+    return _bool_env("GITHUB_PR_RUNTIME_ENABLED", False)
+
+def _safe_main_write_allowed() -> bool:
+    return _bool_env("ALLOW_GITHUB_MAIN_DIRECT", False)
+
 _PATCH_APPROVAL_MARKERS = (
     "de acordo",
     "aprovado",
@@ -46,7 +59,7 @@ _DEPLOY_APPROVAL_MARKERS = (
 _GITHUB_KEYWORDS = (
     "github", "repo", "repositório", "repositorio", "branch", "ramo", "commit",
     "pull request", "pr ", "arquivo", "file ", "código", "codigo", "crie",
-    "criar", "novo arquivo", "main",
+    "criar", "novo arquivo", "main", "execute github", "executar github", "github write", "github read", "runtime_probe",
 )
 
 _DB_KEYWORDS = (
@@ -213,13 +226,27 @@ def _extract_db_table(message: str) -> str:
 
 def _looks_like_create_branch(message: str) -> bool:
     low = (message or "").lower()
-    return ("branch" in low or "ramo" in low) and any(k in low for k in ("crie", "criar", "abra", "gerar"))
+    return ("branch" in low or "ramo" in low) and any(k in low for k in ("crie", "criar", "abra", "gerar", "execute", "executar"))
 
 
 def _looks_like_create_file(message: str) -> bool:
     low = (message or "").lower()
-    return any(k in low for k in ("crie", "criar", "novo arquivo", "adicione arquivo")) and any(k in low for k in ("arquivo", "file"))
+    return any(k in low for k in ("crie", "criar", "novo arquivo", "adicione arquivo", "execute", "executar")) and any(k in low for k in ("arquivo", "file"))
 
+
+def has_explicit_execute_intent(message: str) -> bool:
+    low = (message or "").lower()
+    return any(k in low for k in ("execute github", "executar github", "github write", "github read", "crie a branch", "crie uma branch", "create branch", "crie o arquivo", "crie um arquivo", "create file", "atualize o arquivo", "update file", "pull request", "abra pr", "open pr"))
+
+def wants_pull_request(message: str) -> bool:
+    low = (message or "").lower()
+    if any(k in low for k in ("sem pr", "não abra pr", "nao abra pr", "without pr")):
+        return False
+    return any(k in low for k in ("pull request", "abra pr", "open pr", "crie pr", "create pr"))
+
+def wants_prepare_only(message: str) -> bool:
+    low = (message or "").lower()
+    return any(k in low for k in ("prepare apenas", "prepare only", "não aplique", "nao aplique", "somente diff", "apenas diff"))
 
 def resolve_orion_github_operation(message: str) -> Dict[str, Any]:
     s = (message or "").strip()
@@ -235,9 +262,9 @@ def resolve_orion_github_operation(message: str) -> Dict[str, Any]:
     if _looks_like_create_branch(s):
         return {"kind": "create_branch", "branch_name": _extract_branch_create_name(s), "source_branch": _env("GITHUB_BRANCH", "main")}
     if path and _looks_like_create_file(s):
-        return {"kind": "create_file", "branch": branch, "path": path, "content": _extract_content_literal(s) or ""}
+        return {"kind": "create_file", "branch": branch, "path": path, "content": _extract_content_literal(s) or "created by Orion runtime\n", "open_pr": wants_pull_request(s), "prepare_only": wants_prepare_only(s)}
     if any(k in low for k in ("corrija", "corrigir", "ajuste", "ajustar", "aplique", "aplicar", "fix", "patch")) and path:
-        return {"kind": "write_fix", "branch": branch, "path": path}
+        return {"kind": "write_fix", "branch": branch, "path": path, "content": _extract_content_literal(s) or "", "open_pr": wants_pull_request(s), "prepare_only": wants_prepare_only(s)}
     if path and any(k in low for k in ("arquivo", "file", "ler", "abra", "mostrar", "mostre", "analise")):
         return {"kind": "file", "branch": branch, "path": path}
     search_query = _extract_search_query(s)
@@ -291,14 +318,33 @@ def create_orion_branch_name(path: str) -> str:
     return f"orion-fix/{cleaned}-{int(time.time())}"
 
 
+def build_orion_safe_execution_preview(*, path: str, branch: Optional[str], content: str, open_pr: bool) -> Dict[str, Any]:
+    branch_name = (branch or "").strip() or create_orion_branch_name(path)
+    base_branch = (_env("GITHUB_BRANCH", "main") or "main").strip()
+    return {
+        "ok": True,
+        "prepared_only": True,
+        "repo": _env("GITHUB_REPO"),
+        "base_branch": base_branch,
+        "branch": branch_name,
+        "path": path,
+        "content_preview": (content or "")[:240],
+        "pull_request_planned": bool(open_pr),
+        "message": "Patch preparado em modo seguro. Nenhuma escrita foi executada ainda."
+    }
+
 def execute_orion_single_file_fix(payload: OrionGitWriteIn) -> Dict[str, Any]:
+    if not _safe_write_runtime_enabled():
+        raise HTTPException(status_code=403, detail="GitHub write runtime disabled by environment")
     branch_name = (payload.branch or "").strip() or create_orion_branch_name(payload.path)
     base_branch = (payload.base_branch or _env("GITHUB_BRANCH", "main") or "main").strip()
+    if branch_name == base_branch and not _safe_main_write_allowed():
+        raise HTTPException(status_code=403, detail=f"Direct write on '{base_branch}' blocked by safe evolution policy")
     if branch_name != base_branch:
         git_create_branch(BranchCreateIn(branch_name=branch_name, source_branch=base_branch))
     commit_result = git_commit_file(CommitFileIn(path=payload.path, content=payload.content, message=payload.commit_message, branch=branch_name))
     pr_result: Dict[str, Any] = {"ok": False, "created": False}
-    if payload.open_pr and branch_name != base_branch:
+    if payload.open_pr and branch_name != base_branch and _safe_pr_runtime_enabled():
         try:
             pr_result = git_open_pr(PullRequestIn(title=payload.commit_message[:200], body=f"Governed Orion fix for `{payload.path}`.", head=branch_name, base=base_branch))
             pr_result["created"] = True
@@ -337,3 +383,37 @@ def orion_db_check(table: str = "cost_events"):
 @router.post("/db/fix")
 def orion_db_fix(payload: OrionDbFixIn):
     return run_orion_db_fix(payload.table, payload.approval)
+
+
+class OrionExecuteIn(BaseModel):
+    message: str = Field(min_length=3, max_length=12000)
+
+@router.post("/github/execute")
+def orion_github_execute(payload: OrionExecuteIn):
+    op = resolve_orion_github_operation(payload.message)
+    kind = (op or {}).get("kind")
+    if kind in ("health", "tree", "file", "search"):
+        return run_orion_github_read(op)
+    if kind == "create_branch":
+        branch_name = str(op.get("branch_name") or "").strip()
+        if not branch_name:
+            raise HTTPException(status_code=400, detail="Não foi possível extrair o nome da branch")
+        return execute_orion_branch_create(branch_name=branch_name, source_branch=str(op.get("source_branch") or "").strip() or None)
+    if kind in ("create_file", "write_fix"):
+        path = str(op.get("path") or "").strip()
+        branch = str(op.get("branch") or "").strip() or None
+        content = str(op.get("content") or "").strip()
+        open_pr = bool(op.get("open_pr"))
+        if bool(op.get("prepare_only")):
+            return build_orion_safe_execution_preview(path=path, branch=branch, content=content, open_pr=open_pr)
+        if kind == "write_fix" and not content:
+            raise HTTPException(status_code=400, detail="Para write_fix é necessário conteúdo explícito")
+        return execute_orion_single_file_fix(OrionGitWriteIn(
+            path=path,
+            content=content or "created by Orion runtime\n",
+            commit_message=f"Orion runtime update: {path}",
+            branch=branch,
+            base_branch=_env("GITHUB_BRANCH", "main"),
+            open_pr=open_pr,
+        ))
+    raise HTTPException(status_code=400, detail="Nenhuma operação GitHub executável foi identificada")
