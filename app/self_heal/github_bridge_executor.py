@@ -15,7 +15,7 @@ class GitHubBridgeExecutor:
     def __init__(self):
         self.enabled = os.getenv(
             "AUTO_PR_EXECUTION_ENABLED",
-            "true",
+            "false",
         ).lower() in ("1", "true", "yes")
 
         self.github_token = os.getenv("GITHUB_TOKEN")
