@@ -536,7 +536,7 @@ def _reconcile_collab_and_realtime_schema_boot():
         print("COLLAB_REALTIME_SCHEMA_BOOT_FAILED", str(e))
 
 
-def _reconcile_files_schema_boot():
+def _reconcile_self_heal_schema_boot()\n_reconcile_files_schema_boot():
     if ENGINE is None:
         return
 
@@ -718,3 +718,25 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def _reconcile_self_heal_schema_boot():
+    if ENGINE is None:
+        return
+    try:
+        with ENGINE.begin() as conn:
+            conn.execute(text("""
+CREATE TABLE IF NOT EXISTS thread_members (
+    id VARCHAR PRIMARY KEY,
+    org_slug VARCHAR NOT NULL,
+    thread_id VARCHAR NOT NULL,
+    user_id VARCHAR NOT NULL,
+    role VARCHAR NOT NULL,
+    created_at BIGINT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_thread_members_thread_user
+ON thread_members(thread_id, user_id);
+"""))
+        print("SELF_HEAL_SCHEMA_BOOT_OK table=thread_members")
+    except Exception as e:
+        print("SELF_HEAL_SCHEMA_BOOT_FAILED table=thread_members", str(e))
