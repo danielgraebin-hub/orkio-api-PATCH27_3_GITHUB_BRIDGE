@@ -536,7 +536,7 @@ def _reconcile_collab_and_realtime_schema_boot():
         print("COLLAB_REALTIME_SCHEMA_BOOT_FAILED", str(e))
 
 
-def _reconcile_files_schema_boot():
+def _reconcile_self_heal_schema_boot()\n_reconcile_files_schema_boot():
     if ENGINE is None:
         return
 
@@ -718,3 +718,31 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def _reconcile_self_heal_schema_boot():
+    if ENGINE is None:
+        return
+    try:
+        with ENGINE.begin() as conn:
+            conn.execute(text("""
+CREATE TABLE IF NOT EXISTS realtime_sessions (
+    id VARCHAR PRIMARY KEY,
+    org_slug VARCHAR NOT NULL,
+    thread_id VARCHAR NOT NULL,
+    agent_id VARCHAR,
+    agent_name VARCHAR,
+    user_id VARCHAR,
+    user_name VARCHAR,
+    model VARCHAR,
+    voice VARCHAR,
+    started_at BIGINT NOT NULL,
+    ended_at BIGINT,
+    meta TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_realtime_sessions_thread
+ON realtime_sessions(thread_id);
+"""))
+        print("SELF_HEAL_SCHEMA_BOOT_OK table=realtime_sessions")
+    except Exception as e:
+        print("SELF_HEAL_SCHEMA_BOOT_FAILED table=realtime_sessions", str(e))
